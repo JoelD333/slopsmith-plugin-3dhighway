@@ -1,0 +1,6 @@
+{
+    "id": "highway_3d",
+    "name": "3D Highway",
+    "version": "1.0.0",
+    "script": "screen.js"
+}
