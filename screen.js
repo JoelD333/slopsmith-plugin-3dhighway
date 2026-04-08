@@ -19,10 +19,10 @@
     ];
 
     // Fretboard geometry
-    const SCALE  = 200;
+    const SCALE  = 70;
     const NFRETS = 24;
     const NSTR   = 6;
-    const S_GAP  = 3;
+    const S_GAP  = 2;
     const DOTS   = [3, 5, 7, 9, 12, 15, 17, 19, 21, 24];
     const DDOTS  = new Set([12, 24]);
 
@@ -32,11 +32,11 @@
     const TS     = 150;  // world-units per second
 
     // Note dimensions
-    const NW = 2.8, NH = 2.0, ND = 1.5;
-    const SW = 0.7, SH = 0.5;  // sustain cross-section
+    const NW = 1.6, NH = 1.2, ND = 1.0;
+    const SW = 0.35, SH = 0.25;  // sustain cross-section
 
     // Camera
-    const CY = 32, CZ = 50, LZ = -130;
+    const CY = 16, CZ = 30, LZ = -100;
     const LERP = 0.04;
 
     /* ======================================================================
@@ -224,7 +224,7 @@
     function buildBoard() {
         while (fretG.children.length) fretG.remove(fretG.children[0]);
 
-        const bw = fretX(NFRETS) + 10;
+        const bw = fretX(NFRETS) + 4;
         const bl = TS * (AHEAD + BEHIND);
 
         // Dark fretboard plane
@@ -236,7 +236,7 @@
         });
         const p = new T.Mesh(pg, pm);
         p.rotation.x = -Math.PI / 2;
-        p.position.set(bw / 2 - 5, -1.2, -bl / 2 + TS * BEHIND);
+        p.position.set(bw / 2 - 2, -1.2, -bl / 2 + TS * BEHIND);
         fretG.add(p);
 
         const zN = TS * BEHIND;
@@ -245,8 +245,8 @@
         // String lane lines (left edge, running into distance)
         for (let s = 0; s < NSTR; s++) {
             const g = new T.BufferGeometry().setFromPoints([
-                new T.Vector3(-4, sY(s), zN),
-                new T.Vector3(-4, sY(s), zF),
+                new T.Vector3(-2, sY(s), zN),
+                new T.Vector3(-2, sY(s), zF),
             ]);
             fretG.add(
                 new T.Line(
@@ -280,15 +280,15 @@
         }
 
         // Now-line (bright cyan)
-        const nw = bw + 5;
+        const nw = bw + 2;
         const ng = new T.BufferGeometry().setFromPoints([
-            new T.Vector3(-6, -0.3, 0),
+            new T.Vector3(-3, -0.3, 0),
             new T.Vector3(nw, -0.3, 0),
         ]);
         fretG.add(new T.Line(ng, new T.LineBasicMaterial({ color: 0x00dddd })));
 
         // Now-line glow strip
-        const gg = new T.PlaneGeometry(nw + 6, 3);
+        const gg = new T.PlaneGeometry(nw + 3, 2);
         const gm = new T.MeshBasicMaterial({
             color: 0x00dddd,
             transparent: true,
@@ -297,21 +297,21 @@
         });
         const gp = new T.Mesh(gg, gm);
         gp.rotation.x = -Math.PI / 2;
-        gp.position.set(nw / 2 - 3, -1, 0);
+        gp.position.set(nw / 2 - 1.5, -1, 0);
         fretG.add(gp);
 
         // Fret dots
-        const dg = new T.SphereGeometry(0.45, 8, 6);
+        const dg = new T.SphereGeometry(0.3, 8, 6);
         const dm = new T.MeshBasicMaterial({ color: 0x556677 });
         const my = sY(NSTR - 1) / 2;
         for (const f of DOTS) {
             const cx = fretMid(f);
             if (DDOTS.has(f)) {
                 let d = new T.Mesh(dg, dm);
-                d.position.set(cx, my - 2.5, 0);
+                d.position.set(cx, my - 1.5, 0);
                 fretG.add(d);
                 d = new T.Mesh(dg, dm);
-                d.position.set(cx, my + 2.5, 0);
+                d.position.set(cx, my + 1.5, 0);
                 fretG.add(d);
             } else {
                 const d = new T.Mesh(dg, dm);
@@ -394,9 +394,9 @@
                 // Bracket connecting chord notes
                 if (sMax > sMin) {
                     const bx =
-                        cf < 99 ? fretX(Math.max(0, cf - 1)) - 1.8 : -4;
-                    const bB = sY(sMin) - 1;
-                    const bH = sY(sMax) - sY(sMin) + 2;
+                        cf < 99 ? fretX(Math.max(0, cf - 1)) - 1 : -2;
+                    const bB = sY(sMin) - 0.6;
+                    const bH = sY(sMax) - sY(sMin) + 1.2;
                     const br = pBrack.get();
                     br.position.set(bx, bB + bH / 2, dZ(ch.t - now));
                     br.scale.set(1, bH, 1);
@@ -406,7 +406,7 @@
 
         /* ── beat lines ── */
         if (beats) {
-            const bw = fretX(NFRETS) + 8;
+            const bw = fretX(NFRETS) + 4;
             let lastM = -1;
             for (const b of beats) {
                 const meas = b.measure !== lastM;
@@ -415,7 +415,7 @@
                 const bl = pBeat.get();
                 bl.material = meas ? mBeatM : mBeatQ;
                 bl.scale.set(bw, 1, 1);
-                bl.position.set(-4, -0.6, dZ(b.time - now));
+                bl.position.set(-2, -0.6, dZ(b.time - now));
             }
         }
 
@@ -425,10 +425,10 @@
                 if (s.time < t0 || s.time > t1) continue;
                 const sp = pSec.get();
                 sp.material = txtMat(s.name, '#00cccc', true);
-                sp.scale.set(12, 3, 1);
+                sp.scale.set(8, 2, 1);
                 sp.position.set(
                     fretX(12),
-                    sY(NSTR - 1) + 8,
+                    sY(NSTR - 1) + 5,
                     dZ(s.time - now),
                 );
             }
@@ -472,8 +472,8 @@
         if (n.bn > 0) {
             const l = pLbl.get();
             l.material = txtMat('\u2191', '#ff4', false);
-            l.scale.set(2, 2, 1);
-            l.position.set(x, y + NH + 0.5, z);
+            l.scale.set(1.2, 1.2, 1);
+            l.position.set(x, y + NH + 0.3, z);
         }
         if (n.sl && n.sl !== -1) {
             const l = pLbl.get();
@@ -482,37 +482,37 @@
                 '#ff4',
                 false,
             );
-            l.scale.set(1.6, 1.6, 1);
-            l.position.set(x + NW * 0.45, y + NH * 0.5, z);
+            l.scale.set(1.0, 1.0, 1);
+            l.position.set(x + NW * 0.45, y + NH * 0.4, z);
         }
         if (n.ho) {
             const l = pLbl.get();
             l.material = txtMat('H', '#fff', false);
-            l.scale.set(1.4, 1.4, 1);
-            l.position.set(x + NW * 0.45, y + NH * 0.5, z);
+            l.scale.set(0.9, 0.9, 1);
+            l.position.set(x + NW * 0.45, y + NH * 0.4, z);
         }
         if (n.po) {
             const l = pLbl.get();
             l.material = txtMat('P', '#fff', false);
-            l.scale.set(1.4, 1.4, 1);
-            l.position.set(x + NW * 0.45, y + NH * 0.5, z);
+            l.scale.set(0.9, 0.9, 1);
+            l.position.set(x + NW * 0.45, y + NH * 0.4, z);
         }
         if (n.tp) {
             const l = pLbl.get();
             l.material = txtMat('T', '#0ff', false);
-            l.scale.set(1.4, 1.4, 1);
-            l.position.set(x + NW * 0.45, y + NH * 0.5, z);
+            l.scale.set(0.9, 0.9, 1);
+            l.position.set(x + NW * 0.45, y + NH * 0.4, z);
         }
         if (n.hm || n.hp) {
             const l = pLbl.get();
             l.material = txtMat('\u25C7', '#0ff', false);
-            l.scale.set(1.8, 1.8, 1);
-            l.position.set(x, y + NH + 0.5, z);
+            l.scale.set(1.1, 1.1, 1);
+            l.position.set(x, y + NH + 0.3, z);
         }
         if (n.pm) {
             const l = pLbl.get();
             l.material = txtMat('PM', '#888', true);
-            l.scale.set(2, 1.5, 1);
+            l.scale.set(1.4, 1.0, 1);
             l.position.set(x, y - NH, z);
         }
     }
