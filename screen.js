@@ -442,8 +442,10 @@
                 }
 
                 // Chord bracket: horizontal bar + vertical stems (L-corners)
-                if (ch.notes.length > 1) {
-                    const cz = dZ(ch.t - now);
+                // Hide bracket once chord has crossed the strings
+                const chDt = ch.t - now;
+                if (ch.notes.length > 1 && chDt > -0.05) {
+                    const cz = dZ(chDt);
                     const barY = sY(sMax) + S_GAP * 0.6;
 
                     // Find X extents (open strings use chord center)
