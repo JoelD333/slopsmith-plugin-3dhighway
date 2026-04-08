@@ -145,7 +145,7 @@
         wrap = document.createElement('div');
         wrap.id = 'h3d';
         wrap.style.cssText =
-            'position:absolute;top:0;left:0;right:0;z-index:4;display:none;';
+            'position:absolute;top:0;left:0;right:0;z-index:4;pointer-events:none;display:none;';
         player.insertBefore(wrap, document.getElementById('highway').nextSibling);
 
         ren = new T.WebGLRenderer({ antialias: true });
