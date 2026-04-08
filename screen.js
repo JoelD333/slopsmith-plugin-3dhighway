@@ -2,70 +2,88 @@
     'use strict';
 
     /* ======================================================================
-     *  Constants
+     *  Constants — derived from ChartPlayer's FretPlayerScene3D.cs
+     *  All ref values are from ChartPlayer (scaleLength=300 space).
+     *  K = SCALE / 300 maps them into our world-unit space.
      * ====================================================================== */
 
     const CDN =
         'https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.min.js';
 
-    // Rocksmith string colours  (0 = low-E … 5 = high-e)
     const S_COL = [
-        0xcc2222, // Red
-        0xddaa00, // Yellow
-        0x2266dd, // Blue
-        0xdd8800, // Orange
-        0x22aa22, // Green
-        0x8822cc, // Purple
+        0xcc2222, 0xddaa00, 0x2266dd, 0xdd8800, 0x22aa22, 0x8822cc,
     ];
 
-    // Fretboard geometry
-    const SCALE  = 70;
+    const SCALE  = 3;
+    const K      = SCALE / 300;      // unit scale factor
+
     const NFRETS = 24;
     const NSTR   = 6;
-    const S_GAP  = 2;
-    const DOTS   = [3, 5, 7, 9, 12, 15, 17, 19, 21, 24];
-    const DDOTS  = new Set([12, 24]);
 
-    // Time / display
+    // String layout  (ChartPlayer: Y = 3 + string * 4)
+    const S_BASE = 3 * K;
+    const S_GAP  = 4 * K;
+
+    // Time  (ChartPlayer: timeScale = NoteDisplayDistance / NoteDisplaySeconds = 600/3)
     const AHEAD  = 3.0;
     const BEHIND = 0.5;
-    const TS     = 150;  // world-units per second
+    const TS     = 200 * K;
 
-    // Note dimensions
-    const NW = 1.6, NH = 1.2, ND = 1.0;
-    const SW = 0.35, SH = 0.25;  // sustain cross-section
+    // Note dimensions — vertical rounded rectangles
+    const NW = 5 * K,  NH = 7 * K,  ND = 2 * K;
+    const N_RAD = 1.5 * K;   // corner radius
+    const SW = 2 * K,  SH = 1.5 * K;
 
-    // Camera
-    const CY = 16, CZ = 30, LZ = -100;
-    const LERP = 0.04;
+    // Camera  (ChartPlayer FretCamera base, pulled back to see full board)
+    const CAM_H_BASE = 150 * K;
+    const CAM_DIST_BASE = 240 * K;
+    const REF_ASPECT = 16 / 9;    // reference aspect ratio these values were tuned for
+    const FOCUS_D  = 600 * K;
+    const CAM_LERP_BASE = 0.02;   // base lerp at 120 BPM (~highway.js rate)
+    let aspectScale = 1;           // updated on resize
+
+    // Fog  (ChartPlayer: start=400, end=cameraDistance+focusDist)
+    const FOG_START = 400 * K;
+    const FOG_END   = 670 * K;
+
+    const DOTS  = [3, 5, 7, 9, 12, 15, 17, 19, 21, 24];
+    const DDOTS = new Set([12, 24]);
 
     /* ======================================================================
      *  State
      * ====================================================================== */
 
-    let T;                              // THREE namespace
+    let T;
     let on = false;
     let scene, cam, ren, wrap;
     let fretG, noteG, beatG, lblG;
     let raf = null;
     let tgtX = 0, curX = 0;
+    let tgtDist = CAM_DIST_BASE, curDist = CAM_DIST_BASE;
 
-    // Shared geometry & materials
     let gNote, gSus, gBeat, gBracket;
     let mStr = [], mGlow = [], mSus = [];
     let mBeatM, mBeatQ;
     let txtCache = {};
 
-    // Object pools
-    let pNote, pSus, pLbl, pBeat, pBrack, pSec;
+    let pNote, pSus, pLbl, pBeat, pBrack, pSec, pChLine, pChBar, pChStem;
+    let gChStem, mChord;
 
     /* ======================================================================
      *  Helpers
      * ====================================================================== */
 
+    function bendText(bn) {
+        if (bn === 0.5) return '\u00BD';
+        if (bn === 1) return 'full';
+        if (bn === 1.5) return '1\u00BD';
+        if (bn >= 2) return String(Math.round(bn));
+        return bn.toFixed(1);
+    }
+
     const fretX   = f => (f <= 0 ? 0 : SCALE - SCALE / Math.pow(2, f / 12));
-    const fretMid = f => (f <= 0 ? -2 : (fretX(f - 1) + fretX(f)) / 2);
-    const sY      = s => s * S_GAP;
+    const fretMid = f => (f <= 0 ? -2 * K : (fretX(f - 1) + fretX(f)) / 2);
+    const sY      = s => S_BASE + s * S_GAP;
     const dZ      = dt => -dt * TS;
 
     function txtMat(text, col, wide) {
@@ -127,8 +145,7 @@
         wrap = document.createElement('div');
         wrap.id = 'h3d';
         wrap.style.cssText =
-            'position:absolute;top:0;left:0;width:100%;height:100%;' +
-            'z-index:15;display:none;';
+            'position:absolute;top:0;left:0;right:0;z-index:15;display:none;';
         player.insertBefore(wrap, document.getElementById('highway').nextSibling);
 
         ren = new T.WebGLRenderer({ antialias: true });
@@ -137,13 +154,13 @@
         wrap.appendChild(ren.domElement);
 
         scene = new T.Scene();
-        scene.fog = new T.Fog(0x08080e, 260, 520);
+        scene.fog = new T.Fog(0x08080e, FOG_START, FOG_END);
 
-        cam = new T.PerspectiveCamera(50, 1, 0.5, 2000);
+        cam = new T.PerspectiveCamera(45, 1, 0.01, FOG_END * 3);
 
         scene.add(new T.AmbientLight(0xffffff, 0.65));
         const dl = new T.DirectionalLight(0xffffff, 0.55);
-        dl.position.set(60, 80, 40);
+        dl.position.set(60 * K, 80 * K, 40 * K);
         scene.add(dl);
 
         fretG = new T.Group(); scene.add(fretG);
@@ -151,12 +168,27 @@
         beatG = new T.Group(); scene.add(beatG);
         lblG  = new T.Group(); scene.add(lblG);
 
-        gNote    = new T.BoxGeometry(NW, NH, ND);
+        // Rounded rectangle note shape (extruded 2D rounded rect)
+        const noteShape = new T.Shape();
+        const hw = NW / 2, hh = NH / 2, r = Math.min(N_RAD, hw, hh);
+        noteShape.moveTo(-hw + r, -hh);
+        noteShape.lineTo(hw - r, -hh);
+        noteShape.quadraticCurveTo(hw, -hh, hw, -hh + r);
+        noteShape.lineTo(hw, hh - r);
+        noteShape.quadraticCurveTo(hw, hh, hw - r, hh);
+        noteShape.lineTo(-hw + r, hh);
+        noteShape.quadraticCurveTo(-hw, hh, -hw, hh - r);
+        noteShape.lineTo(-hw, -hh + r);
+        noteShape.quadraticCurveTo(-hw, -hh, -hw + r, -hh);
+        gNote = new T.ExtrudeGeometry(noteShape, {
+            depth: ND, bevelEnabled: false,
+        });
+        gNote.translate(0, 0, -ND / 2);  // center on Z
         gSus     = new T.BoxGeometry(1, 1, 1);
         gBeat    = new T.BufferGeometry().setFromPoints(
             [new T.Vector3(0, 0, 0), new T.Vector3(1, 0, 0)],
         );
-        gBracket = new T.BoxGeometry(0.25, 1, 0.25);
+        gBracket = new T.BoxGeometry(0.5 * K, 1, 0.5 * K);
 
         mStr  = S_COL.map(c => new T.MeshLambertMaterial({ color: c }));
         mGlow = S_COL.map(c =>
@@ -200,6 +232,24 @@
             ),
         );
         pSec = pool(lblG, () => new T.Sprite(txtMat('', '#0dd', true)));
+        pChLine = pool(noteG, () => {
+            const g = new T.BufferGeometry();
+            g.setAttribute('position',
+                new T.Float32BufferAttribute([0, 0, 0, 1, 0, 0], 3));
+            return new T.Line(g, new T.LineBasicMaterial({
+                color: 0xffffff, transparent: true, opacity: 0.6,
+            }));
+        });
+
+        // Chord bracket pieces (all #50a0dc)
+        mChord = new T.MeshBasicMaterial({ color: 0x50a0dc });
+        const barThick = 1 * K;  // bar/stem thickness
+        // Bar: unit-width box, scaled in X per chord
+        const gChBarGeo = new T.BoxGeometry(1, barThick, ND * 0.5);
+        pChBar = pool(noteG, () => new T.Mesh(gChBarGeo, mChord));
+        // Stem: unit-height box, scaled in Y per stem
+        const gChStemGeo = new T.BoxGeometry(barThick, 1, ND * 0.5);
+        pChStem = pool(noteG, () => new T.Mesh(gChStemGeo, mChord));
 
         buildBoard();
         resize();
@@ -213,8 +263,11 @@
         const w = innerWidth;
         const h = innerHeight - ch;
         ren.setSize(w, h);
+        if (wrap) wrap.style.height = h + 'px';
         cam.aspect = w / h;
         cam.updateProjectionMatrix();
+        // Narrower windows need the camera further back to show the same fret range
+        aspectScale = REF_ASPECT / Math.max(cam.aspect, 0.5);
     }
 
     /* ======================================================================
@@ -224,7 +277,7 @@
     function buildBoard() {
         while (fretG.children.length) fretG.remove(fretG.children[0]);
 
-        const bw = fretX(NFRETS) + 4;
+        const bw = fretX(NFRETS) + 4 * K;
         const bl = TS * (AHEAD + BEHIND);
 
         // Dark fretboard plane
@@ -236,36 +289,18 @@
         });
         const p = new T.Mesh(pg, pm);
         p.rotation.x = -Math.PI / 2;
-        p.position.set(bw / 2 - 2, -1.2, -bl / 2 + TS * BEHIND);
+        p.position.set(bw / 2 - 2 * K, S_BASE - 2 * K, -bl / 2 + TS * BEHIND);
         fretG.add(p);
 
         const zN = TS * BEHIND;
         const zF = -TS * AHEAD;
 
-        // String lane lines (left edge, running into distance)
-        for (let s = 0; s < NSTR; s++) {
-            const g = new T.BufferGeometry().setFromPoints([
-                new T.Vector3(-2, sY(s), zN),
-                new T.Vector3(-2, sY(s), zF),
-            ]);
-            fretG.add(
-                new T.Line(
-                    g,
-                    new T.LineBasicMaterial({
-                        color: S_COL[s],
-                        transparent: true,
-                        opacity: 0.22,
-                    }),
-                ),
-            );
-        }
-
-        // Fret wires at Z = 0 (the now-line reference)
+        // Fret wires at Z = 0
         for (let f = 0; f <= NFRETS; f++) {
             const x = fretX(f);
             const g = new T.BufferGeometry().setFromPoints([
-                new T.Vector3(x, -0.5, 0),
-                new T.Vector3(x, sY(NSTR - 1) + 1, 0),
+                new T.Vector3(x, S_BASE - 1 * K, 0),
+                new T.Vector3(x, sY(NSTR - 1) + 1 * K, 0),
             ]);
             fretG.add(
                 new T.Line(
@@ -280,15 +315,15 @@
         }
 
         // Now-line (bright cyan)
-        const nw = bw + 2;
+        const nw = bw + 2 * K;
         const ng = new T.BufferGeometry().setFromPoints([
-            new T.Vector3(-3, -0.3, 0),
-            new T.Vector3(nw, -0.3, 0),
+            new T.Vector3(-3 * K, S_BASE - 1 * K, 0),
+            new T.Vector3(nw, S_BASE - 1 * K, 0),
         ]);
         fretG.add(new T.Line(ng, new T.LineBasicMaterial({ color: 0x00dddd })));
 
         // Now-line glow strip
-        const gg = new T.PlaneGeometry(nw + 3, 2);
+        const gg = new T.PlaneGeometry(nw + 2 * K, 2 * K);
         const gm = new T.MeshBasicMaterial({
             color: 0x00dddd,
             transparent: true,
@@ -297,21 +332,21 @@
         });
         const gp = new T.Mesh(gg, gm);
         gp.rotation.x = -Math.PI / 2;
-        gp.position.set(nw / 2 - 1.5, -1, 0);
+        gp.position.set(nw / 2, S_BASE - 1.5 * K, 0);
         fretG.add(gp);
 
         // Fret dots
-        const dg = new T.SphereGeometry(0.3, 8, 6);
+        const dg = new T.SphereGeometry(1.5 * K, 8, 6);
         const dm = new T.MeshBasicMaterial({ color: 0x556677 });
-        const my = sY(NSTR - 1) / 2;
+        const my = (sY(0) + sY(NSTR - 1)) / 2;
         for (const f of DOTS) {
             const cx = fretMid(f);
             if (DDOTS.has(f)) {
                 let d = new T.Mesh(dg, dm);
-                d.position.set(cx, my - 1.5, 0);
+                d.position.set(cx, my - S_GAP * 0.7, 0);
                 fretG.add(d);
                 d = new T.Mesh(dg, dm);
-                d.position.set(cx, my + 1.5, 0);
+                d.position.set(cx, my + S_GAP * 0.7, 0);
                 fretG.add(d);
             } else {
                 const d = new T.Mesh(dg, dm);
@@ -332,9 +367,13 @@
         pBeat.reset();
         pBrack.reset();
         pSec.reset();
+        pChLine.reset();
+        pChBar.reset();
+        pChStem.reset();
 
         const t0 = now - BEHIND;
         const t1 = now + AHEAD;
+        const tCam = t1;  // use full window for stable camera targeting
 
         const notes    = highway.getNotes();
         const chords   = highway.getChords();
@@ -348,7 +387,8 @@
             for (const n of notes) {
                 if (n.t + (n.sus || 0) < t0 || n.t > t1) continue;
                 drawNote(n, now);
-                if (n.f > 0) {
+                // Camera targeting: only track notes in the near window
+                if (n.f > 0 && n.t <= tCam) {
                     fMin = Math.min(fMin, n.f);
                     fMax = Math.max(fMax, n.f);
                     got = true;
@@ -360,13 +400,23 @@
         if (chords) {
             for (const ch of chords) {
                 if (!ch.notes?.length) continue;
-                const mxs = Math.max(
-                    0,
-                    ...ch.notes.map(n => n.sus || 0),
-                );
+                const mxs = Math.max(0, ...ch.notes.map(n => n.sus || 0));
                 if (ch.t + mxs < t0 || ch.t > t1) continue;
 
                 let sMin = 5, sMax = 0, cf = 99;
+
+                // Find center X of fretted notes (for open string positioning)
+                let chordCX = curX;
+                const fretted = ch.notes.filter(cn => cn.f > 0);
+                if (fretted.length > 0) {
+                    let cxL = Infinity, cxR = -Infinity;
+                    for (const fn of fretted) {
+                        const fx = fretMid(fn.f);
+                        cxL = Math.min(cxL, fx);
+                        cxR = Math.max(cxR, fx);
+                    }
+                    chordCX = (cxL + cxR) / 2;
+                }
 
                 for (const cn of ch.notes) {
                     drawNote(
@@ -380,33 +430,56 @@
                             tr: cn.tr,
                         },
                         now,
+                        cn.f === 0 ? chordCX : undefined,
                     );
                     sMin = Math.min(sMin, cn.s);
                     sMax = Math.max(sMax, cn.s);
                     if (cn.f > 0) {
                         cf = Math.min(cf, cn.f);
-                        fMin = Math.min(fMin, cn.f);
-                        fMax = Math.max(fMax, cn.f);
-                        got = true;
+                        if (ch.t <= tCam) {
+                            fMin = Math.min(fMin, cn.f);
+                            fMax = Math.max(fMax, cn.f);
+                            got = true;
+                        }
                     }
                 }
 
-                // Bracket connecting chord notes
-                if (sMax > sMin) {
-                    const bx =
-                        cf < 99 ? fretX(Math.max(0, cf - 1)) - 1 : -2;
-                    const bB = sY(sMin) - 0.6;
-                    const bH = sY(sMax) - sY(sMin) + 1.2;
-                    const br = pBrack.get();
-                    br.position.set(bx, bB + bH / 2, dZ(ch.t - now));
-                    br.scale.set(1, bH, 1);
+                // Chord bracket: horizontal bar + vertical stems (L-corners)
+                if (ch.notes.length > 1) {
+                    const cz = dZ(ch.t - now);
+                    const barY = sY(sMax) + S_GAP * 0.6;
+
+                    // Find X extents (open strings use chord center)
+                    let xMin = Infinity, xMax = -Infinity;
+                    for (const cn of ch.notes) {
+                        const nx = cn.f === 0 ? chordCX : fretMid(cn.f);
+                        xMin = Math.min(xMin, nx);
+                        xMax = Math.max(xMax, nx);
+                    }
+
+                    // Bar spans exactly between outer stems (center to center)
+                    const barW = xMax - xMin;
+                    const bar = pChBar.get();
+                    bar.position.set(xMin + barW / 2, barY, cz);
+                    bar.scale.set(barW, 1, 1);
+
+                    // Vertical stems drop from bar bottom to note top
+                    for (const cn of ch.notes) {
+                        const nx = cn.f === 0 ? chordCX : fretMid(cn.f);
+                        const noteTop = sY(cn.s) + NH * 0.5;
+                        const stemH = barY - noteTop;
+                        if (stemH <= 0) continue;
+                        const stem = pChStem.get();
+                        stem.position.set(nx, noteTop + stemH / 2, cz);
+                        stem.scale.set(1, stemH, 1);
+                    }
                 }
             }
         }
 
         /* ── beat lines ── */
         if (beats) {
-            const bw = fretX(NFRETS) + 4;
+            const bw = fretX(NFRETS) + 4 * K;
             let lastM = -1;
             for (const b of beats) {
                 const meas = b.measure !== lastM;
@@ -415,7 +488,7 @@
                 const bl = pBeat.get();
                 bl.material = meas ? mBeatM : mBeatQ;
                 bl.scale.set(bw, 1, 1);
-                bl.position.set(-2, -0.6, dZ(b.time - now));
+                bl.position.set(-2 * K, S_BASE - 1.5 * K, dZ(b.time - now));
             }
         }
 
@@ -425,38 +498,72 @@
                 if (s.time < t0 || s.time > t1) continue;
                 const sp = pSec.get();
                 sp.material = txtMat(s.name, '#00cccc', true);
-                sp.scale.set(8, 2, 1);
+                sp.scale.set(20 * K, 5 * K, 1);
                 sp.position.set(
                     fretX(12),
-                    sY(NSTR - 1) + 5,
+                    sY(NSTR - 1) + 8 * K,
                     dZ(s.time - now),
                 );
             }
         }
 
         /* ── camera target ── */
-        if (got) tgtX = fretMid(Math.round((fMin + fMax) / 2));
+        if (got) {
+            tgtX = fretMid(Math.round((fMin + fMax) / 2));
+            // Dynamic camera distance based on fret span (ChartPlayer formula)
+            const fretSpan = fMax - fMin;
+            tgtDist = (65 + Math.max(fretSpan, 4) * 3) * K;
+        }
     }
 
-    function drawNote(n, now) {
+    function drawNote(n, now, openX) {
         const s  = n.s;
         const dt = n.t - now;
         const z  = dZ(dt);
-        const x  = fretMid(n.f);
         const y  = sY(s);
         const hit = dt > -0.12 && dt < 0.12;
 
-        // Note box
+        if (n.f === 0) {
+            // Open string: wide horizontal bar centered on context or camera
+            const lineW = 40 * K;
+            const cx = openX !== undefined ? openX : curX;
+            const box = pNote.get();
+            box.material = hit ? mGlow[s] : mStr[s];
+            box.position.set(cx, y, z);
+            box.scale.set(lineW / NW, 0.3, 0.6);
+
+            // "0" label
+            const lb = pLbl.get();
+            lb.material = txtMat(0, hit ? '#fff' : '#ddd', false);
+            lb.scale.set(NW * 0.7, NH * 0.8, 1);
+            lb.position.set(cx, y, z + 0.01 * K);
+
+            if (n.sus > 0) {
+                const len = Math.min(n.sus, AHEAD) * TS;
+                const tr  = pSus.get();
+                tr.material = mSus[s];
+                tr.position.set(cx, y, z - len / 2 - ND * 0.3);
+                tr.scale.set(SW, SH, len);
+            }
+            return;
+        }
+
+        const x = fretMid(n.f);
+        const isHarmonic = n.hm || n.hp;
+
+        // Note box — diamond rotation for harmonics
         const box = pNote.get();
         box.material = hit ? mGlow[s] : mStr[s];
         box.position.set(x, y, z);
+        box.scale.set(1, 1, 1);
+        box.rotation.z = isHarmonic ? Math.PI / 4 : 0;
 
         // Fret number label
-        if (n.f >= 0) {
+        if (n.f > 0) {
             const lb = pLbl.get();
             lb.material = txtMat(n.f, hit ? '#fff' : '#ddd', false);
-            lb.scale.set(NW * 0.65, NH * 0.65, 1);
-            lb.position.set(x, y, z + 0.01);
+            lb.scale.set(NW * 0.7, NH * 0.8, 1);
+            lb.position.set(x, y, z + 0.01 * K);
         }
 
         // Sustain trail
@@ -468,63 +575,91 @@
             tr.scale.set(SW, SH, len);
         }
 
-        // Technique indicators
-        if (n.bn > 0) {
+        // ── Technique indicators (matches highway.js) ──
+
+        // Y offsets: above / below note
+        const hasBend = n.bn > 0;
+        let yo = y + NH * 0.7;  // base above-note offset
+
+        // Bend: curved arrow + amount label (½, full, 1½, 2)
+        if (hasBend) {
             const l = pLbl.get();
-            l.material = txtMat('\u2191', '#ff4', false);
-            l.scale.set(1.2, 1.2, 1);
-            l.position.set(x, y + NH + 0.3, z);
+            l.material = txtMat('\u2191' + bendText(n.bn), '#fff', true);
+            l.scale.set(NW * 0.9, NW * 0.35, 1);
+            l.position.set(x, yo, z);
+            yo += NW * 0.4;
         }
+
+        // Slide: diagonal arrow showing direction
         if (n.sl && n.sl !== -1) {
             const l = pLbl.get();
             l.material = txtMat(
-                n.sl > n.f ? '\u2197' : '\u2198',
-                '#ff4',
-                false,
+                n.sl > n.f ? '\u2197' : '\u2198', '#fff', false,
             );
-            l.scale.set(1.0, 1.0, 1);
-            l.position.set(x + NW * 0.45, y + NH * 0.4, z);
+            l.scale.set(NW * 0.4, NW * 0.4, 1);
+            l.position.set(x + NW * 0.5, yo, z);
         }
-        if (n.ho) {
+
+        // Hammer-on / Pull-off / Tap — mutually exclusive labels
+        if (n.ho || n.po || n.tp) {
+            const label = n.ho ? 'H' : n.po ? 'P' : 'T';
             const l = pLbl.get();
-            l.material = txtMat('H', '#fff', false);
-            l.scale.set(0.9, 0.9, 1);
-            l.position.set(x + NW * 0.45, y + NH * 0.4, z);
+            l.material = txtMat(label, '#fff', false);
+            l.scale.set(NW * 0.35, NW * 0.35, 1);
+            l.position.set(x + NW * 0.5, hasBend ? yo : yo, z);
         }
-        if (n.po) {
+
+        // Accent: ">" marker above note
+        if (n.ac) {
             const l = pLbl.get();
-            l.material = txtMat('P', '#fff', false);
-            l.scale.set(0.9, 0.9, 1);
-            l.position.set(x + NW * 0.45, y + NH * 0.4, z);
+            l.material = txtMat('>', '#fff', false);
+            l.scale.set(NW * 0.4, NW * 0.4, 1);
+            l.position.set(x, yo, z);
+            yo += NW * 0.3;
         }
-        if (n.tp) {
+
+        // Tremolo: wavy yellow line
+        if (n.tr) {
             const l = pLbl.get();
-            l.material = txtMat('T', '#0ff', false);
-            l.scale.set(0.9, 0.9, 1);
-            l.position.set(x + NW * 0.45, y + NH * 0.4, z);
+            l.material = txtMat('~~~', '#ff0', true);
+            l.scale.set(NW * 0.7, NW * 0.2, 1);
+            l.position.set(x, yo, z);
         }
-        if (n.hm || n.hp) {
-            const l = pLbl.get();
-            l.material = txtMat('\u25C7', '#0ff', false);
-            l.scale.set(1.1, 1.1, 1);
-            l.position.set(x, y + NH + 0.3, z);
-        }
+
+        // ── Below note ──
+
+        // Palm mute
         if (n.pm) {
             const l = pLbl.get();
-            l.material = txtMat('PM', '#888', true);
-            l.scale.set(1.4, 1.0, 1);
-            l.position.set(x, y - NH, z);
+            l.material = txtMat('PM', '#aaa', true);
+            l.scale.set(NW * 0.6, NW * 0.25, 1);
+            l.position.set(x, y - NH * 0.8, z);
+        }
+
+        // Pinch harmonic label (below diamond)
+        if (n.hp) {
+            const l = pLbl.get();
+            l.material = txtMat('PH', '#ff0', true);
+            l.scale.set(NW * 0.5, NW * 0.25, 1);
+            l.position.set(x, y - NH - K, z);
         }
     }
 
     /* ======================================================================
-     *  Camera
+     *  Camera  (ChartPlayer FretCamera smooth lerp)
      * ====================================================================== */
 
     function camUpdate() {
-        curX += (tgtX - curX) * LERP;
-        cam.position.set(curX, CY, CZ);
-        cam.lookAt(curX, sY(NSTR - 1) / 2, LZ);
+        // Scale lerp by tempo: faster songs get faster camera response
+        const bpm = highway.getBPM(highway.getTime());
+        const lerp = CAM_LERP_BASE * Math.max(bpm, 60) / 120;
+        curX += (tgtX - curX) * lerp;
+        curDist += (tgtDist - curDist) * lerp;
+        // Scale camera back for narrower viewports so fret coverage stays consistent
+        const dist = curDist * aspectScale;
+        const h = CAM_H_BASE * (dist / CAM_DIST_BASE);
+        cam.position.set(curX, h, dist);
+        cam.lookAt(curX, sY(2.5), -FOCUS_D * 0.3);
     }
 
     /* ======================================================================
@@ -553,14 +688,12 @@
         if (on) {
             if (!ren) initScene();
             wrap.style.display = 'block';
-            hw.style.display = 'none';
             btn.className =
                 'px-3 py-1.5 bg-blue-900/50 rounded-lg text-xs text-blue-300 transition';
             resize();
             animate();
         } else {
             wrap.style.display = 'none';
-            hw.style.display = 'block';
             btn.className =
                 'px-3 py-1.5 bg-dark-600 hover:bg-dark-500 rounded-lg text-xs text-gray-400 transition';
             if (raf) {
@@ -609,7 +742,7 @@
         txtCache = {};
         scene = cam = noteG = beatG = lblG = fretG = null;
         mStr = mGlow = mSus = [];
-        pNote = pSus = pLbl = pBeat = pBrack = pSec = null;
+        pNote = pSus = pLbl = pBeat = pBrack = pSec = pChLine = pChBar = pChStem = null;
     }
 
     /* ======================================================================
@@ -631,7 +764,6 @@
             on = true;
             initScene();
             wrap.style.display = 'block';
-            document.getElementById('highway').style.display = 'none';
             const b = document.getElementById('btn-h3d');
             if (b)
                 b.className =
