@@ -145,7 +145,7 @@
         wrap = document.createElement('div');
         wrap.id = 'h3d';
         wrap.style.cssText =
-            'position:absolute;top:0;left:0;right:0;z-index:15;display:none;';
+            'position:absolute;top:0;left:0;right:0;z-index:4;display:none;';
         player.insertBefore(wrap, document.getElementById('highway').nextSibling);
 
         ren = new T.WebGLRenderer({ antialias: true });
@@ -289,17 +289,35 @@
         });
         const p = new T.Mesh(pg, pm);
         p.rotation.x = -Math.PI / 2;
-        p.position.set(bw / 2 - 2 * K, S_BASE - 2 * K, -bl / 2 + TS * BEHIND);
+        p.position.set(bw / 2 - 2 * K, S_BASE - NH / 2 - 2 * K, -bl / 2 + TS * BEHIND);
         fretG.add(p);
 
         const zN = TS * BEHIND;
         const zF = -TS * AHEAD;
 
+        // Colored strings across fretboard at Z = 0
+        for (let s = 0; s < NSTR; s++) {
+            const g = new T.BufferGeometry().setFromPoints([
+                new T.Vector3(-2 * K, sY(s), 0),
+                new T.Vector3(fretX(NFRETS) + 2 * K, sY(s), 0),
+            ]);
+            fretG.add(
+                new T.Line(
+                    g,
+                    new T.LineBasicMaterial({
+                        color: S_COL[s],
+                        transparent: true,
+                        opacity: 0.5,
+                    }),
+                ),
+            );
+        }
+
         // Fret wires at Z = 0
         for (let f = 0; f <= NFRETS; f++) {
             const x = fretX(f);
             const g = new T.BufferGeometry().setFromPoints([
-                new T.Vector3(x, S_BASE - 1 * K, 0),
+                new T.Vector3(x, S_BASE - NH / 2 - 1 * K, 0),
                 new T.Vector3(x, sY(NSTR - 1) + 1 * K, 0),
             ]);
             fretG.add(
@@ -313,27 +331,6 @@
                 ),
             );
         }
-
-        // Now-line (bright cyan)
-        const nw = bw + 2 * K;
-        const ng = new T.BufferGeometry().setFromPoints([
-            new T.Vector3(-3 * K, S_BASE - 1 * K, 0),
-            new T.Vector3(nw, S_BASE - 1 * K, 0),
-        ]);
-        fretG.add(new T.Line(ng, new T.LineBasicMaterial({ color: 0x00dddd })));
-
-        // Now-line glow strip
-        const gg = new T.PlaneGeometry(nw + 2 * K, 2 * K);
-        const gm = new T.MeshBasicMaterial({
-            color: 0x00dddd,
-            transparent: true,
-            opacity: 0.06,
-            side: T.DoubleSide,
-        });
-        const gp = new T.Mesh(gg, gm);
-        gp.rotation.x = -Math.PI / 2;
-        gp.position.set(nw / 2, S_BASE - 1.5 * K, 0);
-        fretG.add(gp);
 
         // Fret dots
         const dg = new T.SphereGeometry(1.5 * K, 8, 6);
@@ -488,7 +485,7 @@
                 const bl = pBeat.get();
                 bl.material = meas ? mBeatM : mBeatQ;
                 bl.scale.set(bw, 1, 1);
-                bl.position.set(-2 * K, S_BASE - 1.5 * K, dZ(b.time - now));
+                bl.position.set(-2 * K, S_BASE - NH / 2 - 1.5 * K, dZ(b.time - now));
             }
         }
 
@@ -518,10 +515,24 @@
 
     function drawNote(n, now, openX) {
         const s  = n.s;
-        const dt = n.t - now;
-        const z  = dZ(dt);
+        const dt = n.t - now;           // negative = past the string
         const y  = sY(s);
-        const hit = dt > -0.12 && dt < 0.12;
+        const susEnd = n.t + (n.sus || 0);
+        const hasSus = n.sus > 0;
+
+        // Destroy: non-sustained notes vanish after crossing, sustained notes after sustain ends
+        if (dt < -0.05 && (!hasSus || now > susEnd)) return;
+
+        // Is the note currently being sustained? (past the string, sustain still active)
+        const sustained = dt < 0 && hasSus && now <= susEnd;
+        // Approaching / at the string
+        const hitDist = Math.abs(dt);
+        const hit = hitDist < 0.15 || sustained;
+        const hitFade = sustained ? 0.7 : (hitDist < 0.15 ? 1 - hitDist / 0.15 : 0);
+
+        // Sustained notes pin to Z=0 (the string) with vibrato
+        const vibrato = sustained ? Math.sin(now * 30) * 0.3 * K : 0;
+        const noteZ = sustained ? 0 : dZ(dt);
 
         if (n.f === 0) {
             // Open string: wide horizontal bar centered on context or camera
@@ -529,21 +540,27 @@
             const cx = openX !== undefined ? openX : curX;
             const box = pNote.get();
             box.material = hit ? mGlow[s] : mStr[s];
-            box.position.set(cx, y, z);
+            box.position.set(cx, y + vibrato, noteZ);
             box.scale.set(lineW / NW, 0.3, 0.6);
 
             // "0" label
             const lb = pLbl.get();
             lb.material = txtMat(0, hit ? '#fff' : '#ddd', false);
             lb.scale.set(NW * 0.7, NH * 0.8, 1);
-            lb.position.set(cx, y, z + 0.01 * K);
+            lb.position.set(cx, y + vibrato, noteZ + 0.01 * K);
 
-            if (n.sus > 0) {
-                const len = Math.min(n.sus, AHEAD) * TS;
-                const tr  = pSus.get();
-                tr.material = mSus[s];
-                tr.position.set(cx, y, z - len / 2 - ND * 0.3);
-                tr.scale.set(SW, SH, len);
+            if (hasSus) {
+                // Remaining sustain trail (shrinks as sustain is consumed)
+                const susStart = Math.max(n.t, now);
+                const remSus = susEnd - susStart;
+                if (remSus > 0.01) {
+                    const len = Math.min(remSus, AHEAD) * TS;
+                    const trZ = dZ((susStart - now)) - len / 2;
+                    const tr  = pSus.get();
+                    tr.material = mSus[s];
+                    tr.position.set(cx, y, trZ);
+                    tr.scale.set(SW, SH, len);
+                }
             }
             return;
         }
@@ -551,10 +568,15 @@
         const x = fretMid(n.f);
         const isHarmonic = n.hm || n.hp;
 
-        // Note box — diamond rotation for harmonics
+        // Note box — diamond rotation for harmonics, glow at string intersection
         const box = pNote.get();
-        box.material = hit ? mGlow[s] : mStr[s];
-        box.position.set(x, y, z);
+        if (hit) {
+            box.material = mGlow[s];
+            mGlow[s].emissiveIntensity = 0.4 + hitFade * 0.6;
+        } else {
+            box.material = mStr[s];
+        }
+        box.position.set(x, y + vibrato, noteZ);
         box.scale.set(1, 1, 1);
         box.rotation.z = isHarmonic ? Math.PI / 4 : 0;
 
@@ -563,67 +585,71 @@
             const lb = pLbl.get();
             lb.material = txtMat(n.f, hit ? '#fff' : '#ddd', false);
             lb.scale.set(NW * 0.7, NH * 0.8, 1);
-            lb.position.set(x, y, z + 0.01 * K);
+            lb.position.set(x, y + vibrato, noteZ + 0.01 * K);
         }
 
-        // Sustain trail
-        if (n.sus > 0) {
-            const len = Math.min(n.sus, AHEAD) * TS;
-            const tr  = pSus.get();
-            tr.material = mSus[s];
-            tr.position.set(x, y, z - len / 2 - ND / 2);
-            tr.scale.set(SW, SH, len);
+        // Sustain trail (shrinks as consumed)
+        if (hasSus) {
+            const susStart = Math.max(n.t, now);
+            const remSus = susEnd - susStart;
+            if (remSus > 0.01) {
+                const len = Math.min(remSus, AHEAD) * TS;
+                const trZ = dZ((susStart - now)) - len / 2;
+                const tr  = pSus.get();
+                tr.material = mSus[s];
+                tr.position.set(x, y, trZ);
+                tr.scale.set(SW, SH, len);
+            }
         }
 
         // ── Technique indicators (matches highway.js) ──
 
-        // Y offsets: above / below note
         const hasBend = n.bn > 0;
-        let yo = y + NH * 0.7;  // base above-note offset
+        let yo = y + NH * 0.8;
 
-        // Bend: curved arrow + amount label (½, full, 1½, 2)
+        // Bend: arrow + amount (½, full, 1½, 2)
         if (hasBend) {
             const l = pLbl.get();
             l.material = txtMat('\u2191' + bendText(n.bn), '#fff', true);
-            l.scale.set(NW * 0.9, NW * 0.35, 1);
-            l.position.set(x, yo, z);
-            yo += NW * 0.4;
+            l.scale.set(NH * 3.6, NH * 1.5, 1);
+            l.position.set(x, yo, noteZ);
+            yo += NH * 1.2;
         }
 
-        // Slide: diagonal arrow showing direction
+        // Slide: diagonal arrow
         if (n.sl && n.sl !== -1) {
             const l = pLbl.get();
             l.material = txtMat(
                 n.sl > n.f ? '\u2197' : '\u2198', '#fff', false,
             );
-            l.scale.set(NW * 0.4, NW * 0.4, 1);
-            l.position.set(x + NW * 0.5, yo, z);
+            l.scale.set(NH * 1.6, NH * 1.6, 1);
+            l.position.set(x + NW * 0.6, yo, noteZ);
         }
 
-        // Hammer-on / Pull-off / Tap — mutually exclusive labels
+        // Hammer-on / Pull-off / Tap
         if (n.ho || n.po || n.tp) {
             const label = n.ho ? 'H' : n.po ? 'P' : 'T';
             const l = pLbl.get();
             l.material = txtMat(label, '#fff', false);
-            l.scale.set(NW * 0.35, NW * 0.35, 1);
-            l.position.set(x + NW * 0.5, hasBend ? yo : yo, z);
+            l.scale.set(NH * 1.5, NH * 1.5, 1);
+            l.position.set(x + NW * 0.6, yo, noteZ);
         }
 
-        // Accent: ">" marker above note
+        // Accent: ">"
         if (n.ac) {
             const l = pLbl.get();
             l.material = txtMat('>', '#fff', false);
-            l.scale.set(NW * 0.4, NW * 0.4, 1);
-            l.position.set(x, yo, z);
-            yo += NW * 0.3;
+            l.scale.set(NH * 1.6, NH * 1.6, 1);
+            l.position.set(x, yo, noteZ);
+            yo += NH * 1.2;
         }
 
         // Tremolo: wavy yellow line
         if (n.tr) {
             const l = pLbl.get();
             l.material = txtMat('~~~', '#ff0', true);
-            l.scale.set(NW * 0.7, NW * 0.2, 1);
-            l.position.set(x, yo, z);
+            l.scale.set(NH * 3.0, NH * 1.2, 1);
+            l.position.set(x, yo, noteZ);
         }
 
         // ── Below note ──
@@ -632,16 +658,16 @@
         if (n.pm) {
             const l = pLbl.get();
             l.material = txtMat('PM', '#aaa', true);
-            l.scale.set(NW * 0.6, NW * 0.25, 1);
-            l.position.set(x, y - NH * 0.8, z);
+            l.scale.set(NH * 2.4, NH * 1.4, 1);
+            l.position.set(x, y - NH * 0.9, noteZ);
         }
 
-        // Pinch harmonic label (below diamond)
+        // Pinch harmonic label
         if (n.hp) {
             const l = pLbl.get();
             l.material = txtMat('PH', '#ff0', true);
-            l.scale.set(NW * 0.5, NW * 0.25, 1);
-            l.position.set(x, y - NH - K, z);
+            l.scale.set(NH * 2.1, NH * 1.2, 1);
+            l.position.set(x, y - NH * 1.1, noteZ);
         }
     }
 
