@@ -83,7 +83,11 @@
 
     const fretX   = f => (f <= 0 ? 0 : SCALE - SCALE / Math.pow(2, f / 12));
     const fretMid = f => (f <= 0 ? -2 * K : (fretX(f - 1) + fretX(f)) / 2);
-    const sY      = s => S_BASE + s * S_GAP;
+    // When the core Invert toggle is on (highway.getInverted()), flip the
+    // string-to-Y mapping so string 0 (low E) sits at the top instead of
+    // the bottom. Read dynamically per call since the flag can change at
+    // runtime via the toolbar button. See #1.
+    const sY = s => S_BASE + (highway.getInverted() ? (NSTR - 1 - s) : s) * S_GAP;
     const dZ      = dt => -dt * TS;
 
     function txtMat(text, col, wide) {
