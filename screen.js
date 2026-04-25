@@ -1,3 +1,28 @@
+// 3D Highway visualization plugin — Three.js note highway with a
+// 6-string fretboard, fret wires, beat lines, and a camera that
+// follows the playhead.
+//
+// Wave C (slopsmith#36): structural alignment with the Wave C
+// plugin pattern (piano / drums / tabview / jumpingtab). Wave B
+// (PR #4) already shipped the per-instance refactor — state in
+// closure, no module-level singletons except the memoized Three.js
+// library load, no `getElementById('highway')`, no `song:ready`
+// subscription. This wave adds: the standard `_ss*()` splitscreen
+// helper wrappers consumed by the other Wave C plugins, a
+// `_nextInstanceId` counter for DOM tagging, the `_focusSubscribed`
+// belt-and-suspenders pattern around onFocusChange, and a
+// focus-driven scene dim so an unfocused panel's 3D scene visibly
+// recedes when looking at a 4-up quad. Plus a DPR cap reduction
+// under splitscreen since N concurrent WebGLRenderers each at
+// devicePixelRatio:2 would burn GPU bandwidth fast.
+//
+// 3dhighway doesn't have settings panels or MIDI input, so the
+// `_ss*()` surface it consumes is narrower than piano / drums:
+// just `isActive` + `isCanvasFocused` + `onFocusChange` /
+// `offFocusChange`. The `_ssActive()` validator gates on exactly
+// those — partial helpers that lack the focus surface fall back
+// to the main-player single-instance fast path.
+
 (function () {
     'use strict';
 
@@ -131,18 +156,65 @@
     }
 
     /* ======================================================================
+     *  Splitscreen helper wrappers
+     * ======================================================================
+     *
+     *  Centralise the "am I in splitscreen?" / "is this canvas focused?"
+     *  queries so factory code can read the runtime environment
+     *  cheaply. Absence of window.slopsmithSplitscreen OR isActive()===false
+     *  means "main-player, single-instance, always focused" from the
+     *  plugin's POV.
+     *
+     *  3dhighway only consumes the focus surface (no settings panel,
+     *  no MIDI input, no panel-chrome injection). _ssActive()
+     *  validates exactly that surface so a partial helper that ships
+     *  isActive but lacks isCanvasFocused / onFocusChange /
+     *  offFocusChange falls back to the main-player fast path
+     *  rather than reaching a half-broken state.
+     */
+
+    function _ssActive() {
+        const ss = window.slopsmithSplitscreen;
+        if (!ss || typeof ss.isActive !== 'function' || !ss.isActive()) return false;
+        return typeof ss.isCanvasFocused === 'function'
+            && typeof ss.onFocusChange === 'function'
+            && typeof ss.offFocusChange === 'function';
+    }
+
+    function _ssIsCanvasFocused(highwayCanvas) {
+        const ss = window.slopsmithSplitscreen;
+        if (!_ssActive()) return true;  // main-player fast path
+        return !!(ss && typeof ss.isCanvasFocused === 'function' &&
+                  ss.isCanvasFocused(highwayCanvas));
+    }
+
+    /* ======================================================================
+     *  Per-instance counter for DOM tagging
+     * ====================================================================== */
+
+    let _nextInstanceId = 0;
+
+    /* ======================================================================
      *  Factory — slopsmith#36 setRenderer contract
      *
      *  Returns a renderer object matching {init, draw, resize, destroy}.
      *  Core's createHighway() calls init(canvas, bundle) when this viz
      *  is selected, draw(bundle) every rAF frame, resize(w, h) when the
      *  canvas dims change, and destroy() when swapped out or on stop().
+     *
+     *  Wave C: every per-instance state slot below is closured here so
+     *  N concurrent factory instances (one per splitscreen panel) don't
+     *  share state. Module-scope above stays minimal — `T` +
+     *  `threeLoadPromise` are legitimate singletons (one Three.js
+     *  module load per page); `_nextInstanceId` is a counter.
      * ====================================================================== */
 
     function createFactory() {
+        const _instanceId = ++_nextInstanceId;
         // ── Per-instance state ────────────────────────────────────────
         let scene = null, cam = null, ren = null;
         let wrap = null;
+        let ambLight = null, dirLight = null;  // captured for focus-driven dim
         let fretG = null, noteG = null, beatG = null, lblG = null;
         let gNote = null, gSus = null, gBeat = null;
         let mStr = [], mGlow = [], mSus = [];
@@ -168,6 +240,67 @@
 
         let highwayCanvas = null;
         let prevHighwayDisplay = '';
+
+        // ── Wave C focus state ────────────────────────────────────────
+        //
+        // Tracks whether we successfully subscribed to splitscreen
+        // focus-change events. Necessary because subscribe is gated on
+        // _ssActive() (full helper surface + isActive() === true), but
+        // destroy() must still unsubscribe what was actually attached
+        // — we can't re-derive "did we subscribe?" from a fresh
+        // _ssActive() check at destroy time, since isActive() may have
+        // flipped false (splitscreen toggled off) between init and
+        // destroy. Without this flag a defensive offFocusChange call
+        // against a subscription that never happened would be a no-op
+        // for EventTarget but obscures intent; a missed unsubscribe of
+        // one we DID register would leak the listener closure across
+        // the destroy.
+        let _focusSubscribed = false;
+        let _isFocused = true;  // fast-path default; updated in
+                                // _updateFocusState once focus state
+                                // is queryable and the scene exists.
+
+        // ── Listener ref (per-instance so destroy() detach matches) ──
+        const _onFocusChange = () => _updateFocusState();
+
+        // Unsubscribe helper. DRY: every init failure branch + destroy()
+        // + defensive-teardown branch needs to drop the focus
+        // subscription, and missing one (P3 finding from codex on the
+        // initial commit stack) leaves a stale listener pointing at a
+        // factory whose scene was never built / has been torn down.
+        function _unsubscribeFocus() {
+            if (!_focusSubscribed) return;
+            const ss = window.slopsmithSplitscreen;
+            if (ss && typeof ss.offFocusChange === 'function') {
+                ss.offFocusChange(_onFocusChange);
+            }
+            _focusSubscribed = false;
+        }
+
+        function _updateFocusState() {
+            // Belt-and-suspenders: skip if destroyed (a focus-change
+            // event between destroy() and the offFocusChange landing
+            // would otherwise mutate torn-down state).
+            if (_destroyed) return;
+            // Scene-not-ready guard. The async loadThree() window
+            // spans init→_isReady; a focus event during that window
+            // has no scene to dim. The init's .then() block calls
+            // _updateFocusState explicitly after _isReady = true so
+            // the freshly built scene picks up the current state.
+            if (!_isReady) return;
+            const focused = _ssIsCanvasFocused(highwayCanvas);
+            if (focused === _isFocused) return;  // no-op when unchanged
+            _isFocused = focused;
+            // Dim the scene's lighting when this panel isn't focused
+            // so the focused panel visibly pops in a multi-panel
+            // layout. Single uniform intensity update — no rebuild,
+            // no re-render trigger needed (next rAF picks it up).
+            // Main-player path keeps full intensity because
+            // _ssIsCanvasFocused returns the always-focused fast
+            // path when _ssActive() is false.
+            if (ambLight) ambLight.intensity = focused ? 0.65 : 0.35;
+            if (dirLight) dirLight.intensity = focused ? 0.55 : 0.30;
+        }
 
         // ── String-to-Y mapping (closes over _invertedCached) ─────────
         const sY = s => S_BASE + (_invertedCached ? (NSTR - 1 - s) : s) * S_GAP;
@@ -234,16 +367,35 @@
             }
 
             wrap = document.createElement('div');
-            // No fixed DOM id — multiple factory instances (e.g. the
-            // future splitscreen per-panel picker) would collide on a
-            // fixed "h3d" id.
+            // Per-instance DOM tagging. Wave C: N concurrent factory
+            // instances under splitscreen each create their own wrap;
+            // a fixed "h3d" id would collide on getElementById and
+            // would prevent unique per-instance targeting. The shared
+            // class + dataset attributes give plugin-wide CSS or
+            // devtools queries a stable selector across instances,
+            // while the per-instance id remains unique.
+            wrap.id = 'h3d-wrap-' + _instanceId;
+            wrap.className = 'h3d-wrap';
+            wrap.dataset.h3dInstance = String(_instanceId);
             wrap.style.cssText =
                 'position:absolute;top:0;left:0;right:0;z-index:4;pointer-events:none;';
             // Insert after the canvas so we overlay it.
             highwayCanvas.parentNode.insertBefore(wrap, highwayCanvas.nextSibling);
 
             ren = new T.WebGLRenderer({ antialias: true });
-            ren.setPixelRatio(Math.min(devicePixelRatio, 2));
+            // DPR cap — full devicePixelRatio (capped at 2) for the
+            // main-player single-instance path; tighter cap under
+            // splitscreen where N concurrent WebGLRenderers each
+            // allocate framebuffers proportional to backing-store
+            // size. A 4-up quad layout multiplies that 4x on top of
+            // the per-panel halving from the layout itself, so
+            // dropping to 1.25 keeps GPU bandwidth manageable on
+            // worst-case configs while looking nearly identical at
+            // half-screen physical sizes. _ssActive() returns false
+            // outside splitscreen, preserving the original cap.
+            ren.setPixelRatio(_ssActive()
+                ? Math.min(devicePixelRatio, 1.25)
+                : Math.min(devicePixelRatio, 2));
             ren.setClearColor(0x08080e);
             wrap.appendChild(ren.domElement);
 
@@ -252,10 +404,15 @@
 
             cam = new T.PerspectiveCamera(45, 1, 0.01, FOG_END * 3);
 
-            scene.add(new T.AmbientLight(0xffffff, 0.65));
-            const dl = new T.DirectionalLight(0xffffff, 0.55);
-            dl.position.set(60 * K, 80 * K, 40 * K);
-            scene.add(dl);
+            // Stash light refs so _updateFocusState can adjust
+            // intensities when splitscreen focus moves between
+            // panels. Main-player instances never dim — _ssActive()
+            // returns false and _updateFocusState short-circuits.
+            ambLight = new T.AmbientLight(0xffffff, 0.65);
+            scene.add(ambLight);
+            dirLight = new T.DirectionalLight(0xffffff, 0.55);
+            dirLight.position.set(60 * K, 80 * K, 40 * K);
+            scene.add(dirLight);
 
             fretG = new T.Group(); scene.add(fretG);
             noteG = new T.Group(); scene.add(noteG);
@@ -859,6 +1016,7 @@
                 ren = null;
             }
             scene = cam = noteG = beatG = lblG = fretG = null;
+            ambLight = dirLight = null;
             mStr = []; mGlow = []; mSus = [];
             mBeatM = mBeatQ = null;
             pNote = pSus = pLbl = pBeat = pSec = pChBar = pChStem = null;
@@ -901,6 +1059,20 @@
                 // "none" (the hidden state) as the "prior" and a later
                 // destroy() would "restore" the canvas to hidden
                 // permanently.
+                // Unconditional focus-unsubscribe: a prior init() that
+                // got mid-loadThree() then was superseded by THIS init()
+                // (without destroy() in between, e.g. a rapid
+                // setRenderer swap before the CDN load resolved) would
+                // otherwise leave _focusSubscribed = true on a stale
+                // closure, and the subscribe block below would attempt
+                // to register again. EventTarget de-dups same-ref
+                // listeners, but the cleaner posture is to drop the
+                // prior subscription unconditionally at init start so
+                // _focusSubscribed always reflects THIS lifetime's
+                // state. Codex P3 surfaced this on the initial commit
+                // stack — the pre-init unsubscribe was buried inside
+                // the wrap-or-ren defensive-teardown branch.
+                _unsubscribeFocus();
                 if (wrap || ren) {
                     if (highwayCanvas) {
                         highwayCanvas.style.display = prevHighwayDisplay;
@@ -910,6 +1082,17 @@
                 _destroyed = false;
                 _isReady = false;
                 _pendingSize = null;
+                // Reset cached focus state to the default-focused
+                // value. Without this, a destroy/init cycle where the
+                // new lifetime starts with the same focus state as
+                // the previous lifetime ended would skip the
+                // intensity update via _updateFocusState's
+                // change-detect early-return — and the freshly-built
+                // scene's lights default to FULL intensity in
+                // initScene. Result: a previously-unfocused panel
+                // stays bright after re-init even though
+                // _ssIsCanvasFocused still says false.
+                _isFocused = true;
                 const myToken = ++_initToken;
                 highwayCanvas = canvas;
                 // Record the canvas's current display so destroy()
@@ -921,6 +1104,28 @@
                 // has actually succeeded.
                 prevHighwayDisplay = canvas.style.display;
                 _invertedCached = !!(bundle && bundle.inverted);
+
+                // Subscribe to splitscreen focus events synchronously
+                // (BEFORE loadThree). A focus change during the async
+                // CDN window otherwise wouldn't deliver, and the
+                // _updateFocusState call after _isReady would never
+                // run with the right initial value. _updateFocusState
+                // is _isReady-gated internally, so events delivered
+                // pre-scene-build no-op safely; the explicit
+                // _updateFocusState() call after _isReady = true
+                // catches up.
+                //
+                // Subscribe gated on _ssActive() (full helper surface).
+                // A partial helper that ships on/offFocusChange but
+                // lacks isCanvasFocused would otherwise let us
+                // subscribe while _ssIsCanvasFocused fell back to
+                // "always focused" (main-player path), so every
+                // instance would believe itself focused.
+                if (_ssActive()) {
+                    window.slopsmithSplitscreen.onFocusChange(_onFocusChange);
+                    _focusSubscribed = true;
+                }
+
                 // Kick off the lazy Three.js load (memoized at module
                 // scope). Two guards in the continuation: _destroyed
                 // (set by destroy()) and the token check (a newer init
@@ -938,7 +1143,12 @@
                             // canvas visible so the user has a working
                             // highway even though this viz is in a broken
                             // state. They can switch back to "Highway" via
-                            // the picker.
+                            // the picker. Drop the focus subscription
+                            // we registered synchronously in init() —
+                            // there's no scene to dim, and leaving the
+                            // listener attached against a never-built
+                            // factory leaks the closure.
+                            _unsubscribeFocus();
                             return;
                         }
                         // Scene is up — now safe to hide the 2D layer and
@@ -960,16 +1170,27 @@
                         _pendingSize = null;
                         applySize(sz.w, sz.h);
                         _isReady = true;
+                        // Apply the initial focus state now that the
+                        // scene exists. Any focus events that arrived
+                        // during the async loadThree() window were
+                        // safely no-op'd by _updateFocusState's
+                        // !_isReady gate; call it explicitly here so
+                        // the current splitscreen focus is reflected
+                        // on the first frame.
+                        _updateFocusState();
                     } catch (e) {
                         // Anything thrown inside initScene / applySize /
                         // WebGLRenderer construction lands here. Without
                         // this we'd leave a partially-built wrap in the
                         // DOM and potentially a hidden highway canvas.
                         // Clean up and restore the 2D fallback so the
-                        // user isn't stuck with a blank player.
+                        // user isn't stuck with a blank player. Also
+                        // drop the focus subscription so a never-built
+                        // factory doesn't keep receiving events.
                         console.error('[3D-Hwy] init .then() threw; cleaning up', e);
                         _isReady = false;
                         _pendingSize = null;
+                        _unsubscribeFocus();
                         teardown();
                         if (highwayCanvas) {
                             highwayCanvas.style.display = prevHighwayDisplay;
@@ -981,12 +1202,19 @@
                     // was in-flight. Without the _destroyed check,
                     // a rapid setRenderer swap followed by a late CDN
                     // failure would log a spurious error for an
-                    // instance no longer in use.
+                    // instance no longer in use. In both bail cases
+                    // the focus subscription belongs to the newer
+                    // init / destroy already cleaned up — don't touch.
                     if (_initToken !== myToken || _destroyed) return;
                     console.error('[3D-Hwy] init aborted; Three.js unavailable', e);
-                    // 2D canvas was never hidden — no restore needed.
-                    // Core's next setRenderer(null) or arrangement
-                    // switch will proceed cleanly.
+                    // CDN load failed for THIS init lifetime. Drop the
+                    // focus subscription registered synchronously in
+                    // init() — no scene was built, and a stale
+                    // listener against a never-rendered factory leaks
+                    // the closure. 2D canvas was never hidden — no
+                    // restore needed; core's next setRenderer(null) or
+                    // arrangement switch will proceed cleanly.
+                    _unsubscribeFocus();
                 });
             },
             draw(bundle) {
@@ -1019,9 +1247,14 @@
                 applySize(w, h);
             },
             destroy() {
+                // Set BEFORE attempting the (best-effort) unsubscribe
+                // so any focus-change handler that sneaks through a
+                // failed / missing offFocusChange call short-circuits
+                // on the _destroyed guard inside _updateFocusState.
                 _destroyed = true;
                 _isReady = false;
                 _pendingSize = null;
+                _unsubscribeFocus();
                 teardown();
                 if (highwayCanvas) {
                     highwayCanvas.style.display = prevHighwayDisplay;
