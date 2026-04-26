@@ -1,87 +1,74 @@
-// 3D Highway visualization plugin — Three.js note highway with a
-// 6-string fretboard, fret wires, beat lines, and a camera that
-// follows the playhead.
-//
-// Wave C (slopsmith#36): structural alignment with the Wave C
-// plugin pattern (piano / drums / tabview / jumpingtab). Wave B
-// (PR #4) already shipped the per-instance refactor — state in
-// closure, no module-level singletons except the memoized Three.js
-// library load, no `getElementById('highway')`, no `song:ready`
-// subscription. This wave adds: the standard `_ss*()` splitscreen
-// helper wrappers consumed by the other Wave C plugins, a
-// `_nextInstanceId` counter for DOM tagging, the `_focusSubscribed`
-// belt-and-suspenders pattern around onFocusChange, and a
-// focus-driven scene dim so an unfocused panel's 3D scene visibly
-// recedes when looking at a 4-up quad. Plus a DPR cap reduction
-// under splitscreen since N concurrent WebGLRenderers each at
-// devicePixelRatio:2 would burn GPU bandwidth fast.
-//
-// 3dhighway doesn't have settings panels or MIDI input, so the
-// `_ss*()` surface it consumes is narrower than piano / drums:
-// just `isActive` + `isCanvasFocused` + `onFocusChange` /
-// `offFocusChange`. The `_ssActive()` validator gates on exactly
-// those — partial helpers that lack the focus surface fall back
-// to the main-player single-instance fast path.
+// 3D Highway visualization plugin — Three.js note highway.
+// Visual layer from joel's prototype (vibrant palette, glowing strings,
+// fret heat, dynamic lane, chord frame-boxes, per-note connector labels,
+// board projection, outline+core note meshes) adapted into the
+// slopsmithViz setRenderer contract (slopsmith#36) so it works in the
+// main player and per-panel in splitscreen without any architectural
+// changes.
 
 (function () {
     'use strict';
 
     /* ======================================================================
-     *  Constants — derived from ChartPlayer's FretPlayerScene3D.cs
-     *  All ref values are from ChartPlayer (scaleLength=300 space).
-     *  K = SCALE / 300 maps them into our world-unit space.
+     *  Constants
      * ====================================================================== */
 
     const CDN =
         'https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.min.js';
 
+    // Vibrant Rocksmith+ palette
     const S_COL = [
-        0xcc2222, 0xddaa00, 0x2266dd, 0xdd8800, 0x22aa22, 0x8822cc,
+        0xfc2d5d, // String 1 — neon red/pink
+        0xffe100, // String 2 — bright lemon yellow
+        0x00ccff, // String 3 — electric cyan
+        0xff9d00, // String 4 — vivid orange
+        0x10e62c, // String 5 — bright lime
+        0xbc00ff, // String 6 — intense violet
     ];
 
-    const SCALE  = 3;
-    const K      = SCALE / 300;      // unit scale factor
+    const SCALE = 2.25;
+    const K     = SCALE / 300;
 
     const NFRETS = 24;
     const NSTR   = 6;
 
-    // String layout  (ChartPlayer: Y = 3 + string * 4)
+    const STR_THICK = 0.25 * K;
+
     const S_BASE = 3 * K;
     const S_GAP  = 4 * K;
 
-    // Time  (ChartPlayer: timeScale = NoteDisplayDistance / NoteDisplaySeconds = 600/3)
     const AHEAD  = 3.0;
     const BEHIND = 0.5;
     const TS     = 200 * K;
 
-    // Note dimensions — vertical rounded rectangles
-    const NW = 5 * K,  NH = 7 * K,  ND = 2 * K;
-    const N_RAD = 1.5 * K;   // corner radius
-    const SW = 2 * K,  SH = 1.5 * K;
+    // Shorter, flatter notes (joel style)
+    const NW = 5 * K, NH = 3 * K, ND = 0.5 * K;
+    const N_RAD = 1.5 * K;
+    const SW = 2 * K, SH = 1.5 * K;
 
-    // Camera  (ChartPlayer FretCamera base, pulled back to see full board)
-    const CAM_H_BASE = 150 * K;
+    const CAM_H_BASE    = 150 * K;
     const CAM_DIST_BASE = 240 * K;
-    const REF_ASPECT = 16 / 9;    // reference aspect ratio these values were tuned for
-    const FOCUS_D  = 600 * K;
-    const CAM_LERP_BASE = 0.02;   // base lerp at 120 BPM (~highway.js rate)
+    const REF_ASPECT    = 16 / 9;
+    const FOCUS_D       = 600 * K;
+    const CAM_LERP_BASE = 0.02;
 
-    // Fog  (ChartPlayer: start=400, end=cameraDistance+focusDist)
-    const FOG_START = 400 * K;
+    const FOG_START = 200 * K;
     const FOG_END   = 670 * K;
 
     const DOTS  = [3, 5, 7, 9, 12, 15, 17, 19, 21, 24];
     const DDOTS = new Set([12, 24]);
 
+    const FRET_COOLDOWN = 0.5; // seconds a lane fret stays active after last note
+
     /* ======================================================================
-     *  Pure helpers (no per-instance state)
+     *  Pure helpers
      * ====================================================================== */
 
     function bendText(bn) {
         if (bn === 0.5) return '½';
-        if (bn === 1) return 'full';
+        if (bn === 1)   return 'full';
         if (bn === 1.5) return '1½';
-        if (bn >= 2) return String(Math.round(bn));
+        if (bn >= 2)    return String(Math.round(bn));
         return bn.toFixed(1);
     }
 
@@ -89,55 +76,28 @@
     const fretMid = f => (f <= 0 ? -2 * K : (fretX(f - 1) + fretX(f)) / 2);
     const dZ      = dt => -dt * TS;
 
-    // Compute BPM from beats nearest the given time. Replicates
-    // highway.getBPM (not in the bundle) so we stay self-contained.
-    // O(log n) — beats arrive sorted by time (slopsmith core guarantees),
-    // so bisect to find the insertion index, then compare the two
-    // candidates on either side to pick the closest. Matters for long
-    // songs at 60fps: the original linear scan was O(beats) per frame.
     function computeBPM(beats, t) {
         if (!beats || beats.length < 2) return 120;
-        // Bisect: find index `lo` such that beats[lo].time >= t (or
-        // beats.length if t is past every beat).
         let lo = 0, hi = beats.length;
         while (lo < hi) {
             const mid = (lo + hi) >> 1;
-            if (beats[mid].time < t) lo = mid + 1;
-            else hi = mid;
+            if (beats[mid].time < t) lo = mid + 1; else hi = mid;
         }
-        // Closest is either lo or lo-1.
         let closest = lo;
-        if (lo === beats.length) {
-            closest = beats.length - 1;
-        } else if (lo > 0 &&
-                   Math.abs(beats[lo - 1].time - t) < Math.abs(beats[lo].time - t)) {
-            closest = lo - 1;
-        }
+        if (lo === beats.length) closest = beats.length - 1;
+        else if (lo > 0 && Math.abs(beats[lo - 1].time - t) < Math.abs(beats[lo].time - t)) closest = lo - 1;
         const start = Math.max(0, closest - 2);
-        const end = Math.min(beats.length - 1, closest + 2);
+        const end   = Math.min(beats.length - 1, closest + 2);
         let sum = 0, count = 0;
         for (let i = start; i < end; i++) {
             const dt = beats[i + 1].time - beats[i].time;
-            // Skip zero/negative intervals — duplicate timestamps or
-            // out-of-order beats would otherwise drag sum to <= 0
-            // and return Infinity/NaN, wedging the camera lerp with
-            // poisoned values.
-            if (dt > 0) {
-                sum += dt;
-                count++;
-            }
+            if (dt > 0) { sum += dt; count++; }
         }
         return count > 0 && sum > 0 ? 60 / (sum / count) : 120;
     }
 
     /* ======================================================================
-     *  Three.js module — loaded lazily on first init() so users who
-     *  never pick 3D don't pay the CDN cost. The promise is memoized
-     *  module-scope: every factory instance shares the same module and
-     *  only the first init triggers the fetch. factory.init() awaits
-     *  it before building its scene; draw() no-ops until init
-     *  completes, so a rapid setRenderer() call before the CDN load
-     *  finishes is safe.
+     *  Three.js module — lazily loaded, memoized
      * ====================================================================== */
 
     let T = null;
@@ -148,7 +108,7 @@
                 .then(mod => { T = mod; return mod; })
                 .catch(e => {
                     console.error('[3D-Hwy] Three.js load failed:', e);
-                    threeLoadPromise = null;  // allow retry on next init
+                    threeLoadPromise = null;
                     throw e;
                 });
         }
@@ -156,164 +116,115 @@
     }
 
     /* ======================================================================
-     *  Splitscreen helper wrappers
-     * ======================================================================
-     *
-     *  Centralise the "am I in splitscreen?" / "is this canvas focused?"
-     *  queries so factory code can read the runtime environment
-     *  cheaply. Absence of window.slopsmithSplitscreen OR isActive()===false
-     *  means "main-player, single-instance, always focused" from the
-     *  plugin's POV.
-     *
-     *  3dhighway only consumes the focus surface (no settings panel,
-     *  no MIDI input, no panel-chrome injection). _ssActive()
-     *  validates exactly that surface so a partial helper that ships
-     *  isActive but lacks isCanvasFocused / onFocusChange /
-     *  offFocusChange falls back to the main-player fast path
-     *  rather than reaching a half-broken state.
-     */
+     *  Splitscreen helpers
+     * ====================================================================== */
 
     function _ssActive() {
         const ss = window.slopsmithSplitscreen;
         if (!ss || typeof ss.isActive !== 'function' || !ss.isActive()) return false;
         return typeof ss.isCanvasFocused === 'function'
-            && typeof ss.onFocusChange === 'function'
-            && typeof ss.offFocusChange === 'function';
+            && typeof ss.onFocusChange   === 'function'
+            && typeof ss.offFocusChange  === 'function';
     }
 
     function _ssIsCanvasFocused(highwayCanvas) {
         const ss = window.slopsmithSplitscreen;
-        if (!_ssActive()) return true;  // main-player fast path
+        if (!_ssActive()) return true;
         return !!(ss && typeof ss.isCanvasFocused === 'function' &&
                   ss.isCanvasFocused(highwayCanvas));
     }
 
     /* ======================================================================
-     *  Per-instance counter for DOM tagging
+     *  Per-instance counter
      * ====================================================================== */
 
     let _nextInstanceId = 0;
 
     /* ======================================================================
      *  Factory — slopsmith#36 setRenderer contract
-     *
-     *  Returns a renderer object matching {init, draw, resize, destroy}.
-     *  Core's createHighway() calls init(canvas, bundle) when this viz
-     *  is selected, draw(bundle) every rAF frame, resize(w, h) when the
-     *  canvas dims change, and destroy() when swapped out or on stop().
-     *
-     *  Wave C: every per-instance state slot below is closured here so
-     *  N concurrent factory instances (one per splitscreen panel) don't
-     *  share state. Module-scope above stays minimal — `T` +
-     *  `threeLoadPromise` are legitimate singletons (one Three.js
-     *  module load per page); `_nextInstanceId` is a counter.
      * ====================================================================== */
 
     function createFactory() {
         const _instanceId = ++_nextInstanceId;
-        // ── Per-instance state ────────────────────────────────────────
+
+        // ── Per-instance Three.js state ───────────────────────────────────
         let scene = null, cam = null, ren = null;
         let wrap = null;
-        let ambLight = null, dirLight = null;  // captured for focus-driven dim
+        let ambLight = null, dirLight = null;
         let fretG = null, noteG = null, beatG = null, lblG = null;
         let gNote = null, gSus = null, gBeat = null;
-        let mStr = [], mGlow = [], mSus = [];
+        let mStr = [], mGlow = [], mSus = [], mProj = [], mProjGlow = [];
+        let mWhiteOutline = null, mSusOutline = null;
+        let pSusOutline = null;
+        let projMeshArr = null, projGlowArr = null;
+        let _probe = null;
+        let _laneTargetColor = null;
+        let _renderScale = 1;
+        let lyricsCanvas = null, lyricsCtx = null;
+        let _diagChord = null;
+        let _lastHwW = 0, _lastHwH = 0;
         let mBeatM = null, mBeatQ = null;
         let txtCache = {};
-        let pNote, pSus, pLbl, pBeat, pSec, pChBar, pChStem;
-        let mChord = null;
+
+        // Object pools
+        let pNote, pSus, pLbl, pBeat, pSec;
+        let pFretLbl, pLane, pLaneDivider;
+        let pChordBox, pChordLbl, pBarreLine;
+        let pNoteFretLabel, pConnectorLine, pDropLine;
+
+        // Dynamic glowing string meshes (BoxGeometry, one per string)
+        let stringLines = [];
+        // Per-fret last-active timestamp for lane persistence
+        let fretLastActiveTime = new Array(NFRETS + 1).fill(0);
+
+        // Active string count — 4 for bass, 6 for everything else
+        let nStr = NSTR;
+
+        // Camera state
         let tgtX = 0, curX = 0;
         let tgtDist = CAM_DIST_BASE, curDist = CAM_DIST_BASE;
+        let tgtLookY = 0, curLookY = 0;   // lerped look-at Y for self-correcting camera
         let aspectScale = 1;
-        let _isReady = false;            // scene built; draw is a no-op until true
-        let _destroyed = false;          // destroy called — discard any pending load
-        let _invertedCached = false;     // read from bundle each frame
-        let _invertedForBoard = false;   // last invert state the fretboard was built for
-        let _pendingSize = null;         // resize() calls before _isReady stash here
-        // Monotonic init counter. Each init() bumps it; the
-        // loadThree().then / .catch closures capture the token and
-        // bail if a newer init has started since. Guards against
-        // init → init (no destroy between) where _destroyed alone
-        // gets reset to false and would let the first load's
-        // continuation fire against the second init's state.
-        let _initToken = 0;
 
-        let highwayCanvas = null;
-        let prevHighwayDisplay = '';
+        // Lifecycle flags
+        let _isReady       = false;
+        let _destroyed     = false;
+        let _invertedCached    = false;
+        let _invertedForBoard  = false;
+        let _initToken     = 0;
+        let highwayCanvas      = null;
 
-        // ── Wave C focus state ────────────────────────────────────────
-        //
-        // Tracks whether we successfully subscribed to splitscreen
-        // focus-change events. Necessary because subscribe is gated on
-        // _ssActive() (full helper surface + isActive() === true), but
-        // destroy() must still unsubscribe what was actually attached
-        // — we can't re-derive "did we subscribe?" from a fresh
-        // _ssActive() check at destroy time, since isActive() may have
-        // flipped false (splitscreen toggled off) between init and
-        // destroy. Without this flag a defensive offFocusChange call
-        // against a subscription that never happened would be a no-op
-        // for EventTarget but obscures intent; a missed unsubscribe of
-        // one we DID register would leak the listener closure across
-        // the destroy.
+        // ── Focus state (splitscreen dim) ─────────────────────────────────
         let _focusSubscribed = false;
-        let _isFocused = true;  // fast-path default; updated in
-                                // _updateFocusState once focus state
-                                // is queryable and the scene exists.
-
-        // ── Listener ref (per-instance so destroy() detach matches) ──
+        let _isFocused = true;
         const _onFocusChange = () => _updateFocusState();
 
-        // Unsubscribe helper. DRY: every init failure branch + destroy()
-        // + defensive-teardown branch needs to drop the focus
-        // subscription, and missing one (P3 finding from codex on the
-        // initial commit stack) leaves a stale listener pointing at a
-        // factory whose scene was never built / has been torn down.
         function _unsubscribeFocus() {
             if (!_focusSubscribed) return;
             const ss = window.slopsmithSplitscreen;
-            if (ss && typeof ss.offFocusChange === 'function') {
-                ss.offFocusChange(_onFocusChange);
-            }
+            if (ss && typeof ss.offFocusChange === 'function') ss.offFocusChange(_onFocusChange);
             _focusSubscribed = false;
         }
 
         function _updateFocusState() {
-            // Belt-and-suspenders: skip if destroyed (a focus-change
-            // event between destroy() and the offFocusChange landing
-            // would otherwise mutate torn-down state).
-            if (_destroyed) return;
-            // Scene-not-ready guard. The async loadThree() window
-            // spans init→_isReady; a focus event during that window
-            // has no scene to dim. The init's .then() block calls
-            // _updateFocusState explicitly after _isReady = true so
-            // the freshly built scene picks up the current state.
-            if (!_isReady) return;
+            if (_destroyed || !_isReady) return;
             const focused = _ssIsCanvasFocused(highwayCanvas);
-            if (focused === _isFocused) return;  // no-op when unchanged
+            if (focused === _isFocused) return;
             _isFocused = focused;
-            // Dim the scene's lighting when this panel isn't focused
-            // so the focused panel visibly pops in a multi-panel
-            // layout. Single uniform intensity update — no rebuild,
-            // no re-render trigger needed (next rAF picks it up).
-            // Main-player path keeps full intensity because
-            // _ssIsCanvasFocused returns the always-focused fast
-            // path when _ssActive() is false.
-            if (ambLight) ambLight.intensity = focused ? 0.65 : 0.35;
-            if (dirLight) dirLight.intensity = focused ? 0.55 : 0.30;
+            if (ambLight) ambLight.intensity = focused ? 0.85 : 0.4;
+            if (dirLight) dirLight.intensity = focused ? 0.8  : 0.35;
         }
 
-        // ── String-to-Y mapping (closes over _invertedCached) ─────────
-        const sY = s => S_BASE + (_invertedCached ? (NSTR - 1 - s) : s) * S_GAP;
+        // ── String-to-Y (respects invert) ─────────────────────────────────
+        const sY = s => S_BASE + (_invertedCached ? s : (nStr - 1 - s)) * S_GAP;
 
-        // ── Text-sprite cache (closes over txtCache) ──────────────────
+        // ── Text-sprite cache ──────────────────────────────────────────────
         function txtMat(text, col, wide) {
             const k = (wide ? 'W' : '') + text + '|' + col;
             if (txtCache[k]) return txtCache[k];
-            const w = wide ? 512 : 128;
-            const h = wide ? 128 : 128;
+            const w = wide ? 512 : 128, h = 128;
             const c = document.createElement('canvas');
-            c.width = w;
-            c.height = h;
+            c.width = w; c.height = h;
             const x = c.getContext('2d');
             x.fillStyle = col;
             x.font = `bold ${wide ? 64 : 80}px monospace`;
@@ -329,89 +240,247 @@
             return mat;
         }
 
-        // ── Object pool (closes over parent group) ─────────────────────
+        // ── Object pool ────────────────────────────────────────────────────
         function pool(parent, mk) {
             const a = [];
             let n = 0;
             return {
                 get() {
-                    if (n < a.length) {
-                        a[n].visible = true;
-                        return a[n++];
-                    }
-                    const o = mk();
-                    parent.add(o);
-                    a.push(o);
-                    n++;
-                    return o;
+                    if (n < a.length) { a[n].visible = true; return a[n++]; }
+                    const o = mk(); parent.add(o); a.push(o); n++; return o;
                 },
-                reset() {
-                    for (let i = 0; i < a.length; i++) a[i].visible = false;
-                    n = 0;
-                },
+                reset() { for (let i = 0; i < a.length; i++) a[i].visible = false; n = 0; },
             };
         }
 
-        /* ── Three.js scene setup. Returns false on missing DOM. ─── */
+        /* ── Lyrics overlay (2D canvas on top of WebGL) ─────────────────── */
+        function drawChordDiagram(ctx, { name, frets, chDt }, inverted) {
+            const CELL = 22, COLS = 6, ROWS = 4;
+            const DOT_R = CELL * 0.3, PAD = 14;
+            const HEADER = Math.round(CELL * 1.6);
+            const MARKER = Math.round(CELL * 0.7);
+            const gridW = CELL * (COLS - 1);
+            const gridH = CELL * ROWS;
+            const boxW  = gridW + PAD * 2;
+            const boxH  = HEADER + MARKER + gridH + PAD;
+            const bx = PAD, by = PAD;
+            const gx = bx + PAD, gy = by + HEADER + MARKER;
+            const opacity = Math.max(0, 1 + chDt / 0.55);
+
+            const playedFrets = frets.filter(f => f > 0);
+            const minFret   = playedFrets.length > 0 ? Math.min(...playedFrets) : 1;
+            const startFret = Math.max(1, minFret);
+            const isFirstPos = startFret === 1;
+
+            ctx.save();
+            ctx.globalAlpha = opacity;
+
+            // Background
+            ctx.fillStyle = 'rgba(8, 14, 22, 0.88)';
+            ctx.beginPath(); ctx.roundRect(bx, by, boxW, boxH, 7); ctx.fill();
+            ctx.strokeStyle = 'rgba(255,255,255,0.15)';
+            ctx.lineWidth = 1;
+            ctx.beginPath(); ctx.roundRect(bx, by, boxW, boxH, 7); ctx.stroke();
+
+            // Chord name
+            ctx.fillStyle = '#e8d080';
+            ctx.font = `bold ${Math.round(CELL * 0.85)}px sans-serif`;
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            ctx.fillText(name, bx + boxW / 2, by + HEADER * 0.55);
+
+            // Nut
+            if (isFirstPos) { ctx.fillStyle = '#ffffff'; ctx.fillRect(gx, gy, gridW, 3); }
+
+            // Fret lines
+            ctx.strokeStyle = 'rgba(255,255,255,0.25)'; ctx.lineWidth = 1;
+            for (let r = (isFirstPos ? 1 : 0); r <= ROWS; r++) {
+                ctx.beginPath(); ctx.moveTo(gx, gy + r * CELL); ctx.lineTo(gx + gridW, gy + r * CELL); ctx.stroke();
+            }
+
+            // String lines
+            for (let s = 0; s < COLS; s++) {
+                ctx.beginPath(); ctx.moveTo(gx + s * CELL, gy); ctx.lineTo(gx + s * CELL, gy + ROWS * CELL); ctx.stroke();
+            }
+
+            // Open/muted markers + dots
+            // Standard orientation: col 0 = low E (string 5), col 5 = high e (string 0)
+            // Inverted flips: col 0 = high e (string 0), col 5 = low E (string 5)
+            for (let col = 0; col < COLS; col++) {
+                const strIdx = inverted ? col : (COLS - 1 - col);
+                const f = frets[strIdx];
+                const sx = gx + col * CELL;
+                const markerY = gy - MARKER * 0.5;
+                if (f < 0) {
+                    const r = CELL * 0.18;
+                    ctx.strokeStyle = '#cc4444'; ctx.lineWidth = 1.5;
+                    ctx.beginPath(); ctx.moveTo(sx - r, markerY - r); ctx.lineTo(sx + r, markerY + r); ctx.stroke();
+                    ctx.beginPath(); ctx.moveTo(sx + r, markerY - r); ctx.lineTo(sx - r, markerY + r); ctx.stroke();
+                } else if (f === 0) {
+                    ctx.strokeStyle = '#88bbff'; ctx.lineWidth = 1.5;
+                    ctx.beginPath(); ctx.arc(sx, markerY, CELL * 0.2, 0, Math.PI * 2); ctx.stroke();
+                } else {
+                    const row = f - startFret;
+                    if (row >= 0 && row < ROWS) {
+                        ctx.fillStyle = '#ffffff';
+                        ctx.beginPath(); ctx.arc(sx, gy + row * CELL + CELL * 0.5, DOT_R, 0, Math.PI * 2); ctx.fill();
+                    }
+                }
+            }
+            ctx.restore();
+        }
+
+        function drawLyrics(lyrics, currentTime, ctx, W, H) {
+            if (!lyrics._lines) {
+                const lines = [];
+                let line = null, word = null;
+                const flushWord = () => { if (word && word.length) line.words.push(word); word = null; };
+                const flushLine = () => { flushWord(); if (line && line.words.length) lines.push(line); line = null; };
+                for (let i = 0; i < lyrics.length; i++) {
+                    const l = lyrics[i];
+                    const raw = l.w || '';
+                    const endsLine = raw.endsWith('+');
+                    const continuesWord = raw.endsWith('-');
+                    if (line && i > 0 && l.t - (lyrics[i - 1].t + lyrics[i - 1].d) > 4.0) flushLine();
+                    if (!line) line = { words: [], start: l.t, end: l.t + l.d };
+                    if (!word) word = [];
+                    word.push(l);
+                    line.end = Math.max(line.end, l.t + l.d);
+                    if (!continuesWord) flushWord();
+                    if (endsLine) flushLine();
+                }
+                flushLine();
+                lyrics._lines = lines;
+            }
+            const allLines = lyrics._lines;
+            if (!allLines.length) return;
+
+            let currentIdx = -1;
+            for (let i = 0; i < allLines.length; i++) {
+                if (allLines[i].start <= currentTime) currentIdx = i;
+                else break;
+            }
+            if (currentIdx === -1) {
+                if (allLines[0].start - currentTime > 2.0) return;
+                currentIdx = 0;
+            }
+            const currentLine = allLines[currentIdx];
+            const nextLine    = allLines[currentIdx + 1] || null;
+            const gapToNext   = nextLine ? (nextLine.start - currentLine.end) : Infinity;
+            if (currentTime > currentLine.end + 0.5 && gapToNext > 3.0) return;
+
+            const linesToShow = [currentLine];
+            if (nextLine && gapToNext <= 3.0) linesToShow.push(nextLine);
+
+            const fontSize    = Math.max(18, H * 0.028) | 0;
+            const lineY       = H * 0.04;
+            const sylText     = s => { const t = s.w || ''; return (t.endsWith('+') || t.endsWith('-')) ? t.slice(0, -1) : t; };
+
+            ctx.font = `bold ${fontSize}px sans-serif`;
+            const spaceWidth = ctx.measureText(' ').width;
+            const maxWidth   = W * 0.8;
+
+            const rows = [];
+            for (const authoredLine of linesToShow) {
+                let row = [], rowWidth = 0;
+                for (const wordSyls of authoredLine.words) {
+                    const parts = [];
+                    let wordWidth = 0;
+                    for (const s of wordSyls) {
+                        const text = sylText(s);
+                        const w = ctx.measureText(text).width;
+                        parts.push({ syl: s, text, width: w });
+                        wordWidth += w;
+                    }
+                    const advance = wordWidth + spaceWidth;
+                    if (row.length > 0 && rowWidth + advance > maxWidth) { rows.push(row); row = []; rowWidth = 0; }
+                    row.push({ parts, advance });
+                    rowWidth += advance;
+                }
+                if (row.length) rows.push(row);
+            }
+
+            const rowHeight   = fontSize + 6;
+            const totalHeight = rows.length * rowHeight + 10;
+            let bgWidth = 0;
+            for (const row of rows) {
+                const rw = row.reduce((s, w) => s + w.advance, 0) - spaceWidth;
+                if (rw > bgWidth) bgWidth = rw;
+            }
+            bgWidth = Math.min(bgWidth + 30, W * 0.85);
+
+            ctx.fillStyle = 'rgba(0,0,0,0.7)';
+            ctx.beginPath();
+            const bx = W / 2 - bgWidth / 2, by = lineY - 4, br = 8;
+            ctx.moveTo(bx + br, by); ctx.lineTo(bx + bgWidth - br, by);
+            ctx.quadraticCurveTo(bx + bgWidth, by, bx + bgWidth, by + br);
+            ctx.lineTo(bx + bgWidth, by + totalHeight - br);
+            ctx.quadraticCurveTo(bx + bgWidth, by + totalHeight, bx + bgWidth - br, by + totalHeight);
+            ctx.lineTo(bx + br, by + totalHeight);
+            ctx.quadraticCurveTo(bx, by + totalHeight, bx, by + totalHeight - br);
+            ctx.lineTo(bx, by + br);
+            ctx.quadraticCurveTo(bx, by, bx + br, by);
+            ctx.closePath();
+            ctx.fill();
+
+            ctx.textAlign = 'left';
+            ctx.textBaseline = 'top';
+            for (let r = 0; r < rows.length; r++) {
+                const row = rows[r];
+                const rowWidth = row.reduce((s, w) => s + w.advance, 0) - spaceWidth;
+                let xPos = W / 2 - rowWidth / 2;
+                const yPos = lineY + r * rowHeight + 2;
+                for (const w of row) {
+                    for (const part of w.parts) {
+                        const l = part.syl;
+                        const isActive = currentTime >= l.t && currentTime < l.t + l.d;
+                        const isPast   = currentTime >= l.t + l.d;
+                        ctx.fillStyle = isActive ? '#4ae0ff' : isPast ? '#8899aa' : '#556677';
+                        ctx.font = `${isActive ? 'bold' : 'normal'} ${fontSize}px sans-serif`;
+                        ctx.fillText(part.text, xPos, yPos);
+                        xPos += part.width;
+                    }
+                    xPos += spaceWidth;
+                }
+            }
+        }
+
+        /* ── Scene initialisation ─────────────────────────────────────────── */
         function initScene() {
-            // Use the canvas we were given instead of
-            // document.getElementById('highway'). That keeps each
-            // factory instance anchored to its own canvas — essential
-            // for splitscreen where multiple panels each have their
-            // own createHighway() call — and avoids a hardcoded id
-            // the core doesn't strictly guarantee. The canvas's
-            // parent is the container we insert the 3D overlay into.
             if (!highwayCanvas || !highwayCanvas.parentNode) {
                 console.error('[3D-Hwy] initScene: canvas has no parent; aborting');
                 return false;
             }
 
+            // Reset per-song lane state
+            fretLastActiveTime.fill(0);
+
             wrap = document.createElement('div');
-            // Per-instance DOM tagging. Wave C: N concurrent factory
-            // instances under splitscreen each create their own wrap;
-            // a fixed "h3d" id would collide on getElementById and
-            // would prevent unique per-instance targeting. The shared
-            // class + dataset attributes give plugin-wide CSS or
-            // devtools queries a stable selector across instances,
-            // while the per-instance id remains unique.
-            wrap.id = 'h3d-wrap-' + _instanceId;
+            wrap.id        = 'h3d-wrap-' + _instanceId;
             wrap.className = 'h3d-wrap';
             wrap.dataset.h3dInstance = String(_instanceId);
-            wrap.style.cssText =
-                'position:absolute;top:0;left:0;right:0;z-index:4;pointer-events:none;';
-            // Insert after the canvas so we overlay it.
+            wrap.style.cssText = 'position:absolute;top:0;left:0;right:0;z-index:2;pointer-events:none;';
             highwayCanvas.parentNode.insertBefore(wrap, highwayCanvas.nextSibling);
 
             ren = new T.WebGLRenderer({ antialias: true });
-            // DPR cap — full devicePixelRatio (capped at 2) for the
-            // main-player single-instance path; tighter cap under
-            // splitscreen where N concurrent WebGLRenderers each
-            // allocate framebuffers proportional to backing-store
-            // size. A 4-up quad layout multiplies that 4x on top of
-            // the per-panel halving from the layout itself, so
-            // dropping to 1.25 keeps GPU bandwidth manageable on
-            // worst-case configs while looking nearly identical at
-            // half-screen physical sizes. _ssActive() returns false
-            // outside splitscreen, preserving the original cap.
-            ren.setPixelRatio(_ssActive()
-                ? Math.min(devicePixelRatio, 1.25)
-                : Math.min(devicePixelRatio, 2));
-            ren.setClearColor(0x08080e);
+            _probe = new T.Vector3();
+            ren.setClearColor(0x101820);
             wrap.appendChild(ren.domElement);
 
+            lyricsCanvas = document.createElement('canvas');
+            lyricsCanvas.style.cssText = 'position:absolute;top:0;left:0;pointer-events:none;z-index:1;';
+            lyricsCtx = lyricsCanvas.getContext('2d');
+            wrap.appendChild(lyricsCanvas);
+
             scene = new T.Scene();
-            scene.fog = new T.Fog(0x08080e, FOG_START, FOG_END);
+            scene.fog = new T.Fog(0x101820, FOG_START * 0.8, FOG_END * 1.2);
 
-            cam = new T.PerspectiveCamera(45, 1, 0.01, FOG_END * 3);
+            cam = new T.PerspectiveCamera(70, 1, 0.01, FOG_END * 3);
 
-            // Stash light refs so _updateFocusState can adjust
-            // intensities when splitscreen focus moves between
-            // panels. Main-player instances never dim — _ssActive()
-            // returns false and _updateFocusState short-circuits.
-            ambLight = new T.AmbientLight(0xffffff, 0.65);
+            ambLight = new T.AmbientLight(0xffffff, 0.85);
             scene.add(ambLight);
-            dirLight = new T.DirectionalLight(0xffffff, 0.55);
-            dirLight.position.set(60 * K, 80 * K, 40 * K);
+            dirLight = new T.DirectionalLight(0xffffff, 0.8);
+            dirLight.position.set(40 * K, 120 * K, 80 * K);
             scene.add(dirLight);
 
             fretG = new T.Group(); scene.add(fretG);
@@ -419,847 +488,917 @@
             beatG = new T.Group(); scene.add(beatG);
             lblG  = new T.Group(); scene.add(lblG);
 
-            // Rounded rectangle note shape (extruded 2D rounded rect)
-            const noteShape = new T.Shape();
-            const nhw = NW / 2, nhh = NH / 2, r = Math.min(N_RAD, nhw, nhh);
-            noteShape.moveTo(-nhw + r, -nhh);
-            noteShape.lineTo(nhw - r, -nhh);
-            noteShape.quadraticCurveTo(nhw, -nhh, nhw, -nhh + r);
-            noteShape.lineTo(nhw, nhh - r);
-            noteShape.quadraticCurveTo(nhw, nhh, nhw - r, nhh);
-            noteShape.lineTo(-nhw + r, nhh);
-            noteShape.quadraticCurveTo(-nhw, nhh, -nhw, nhh - r);
-            noteShape.lineTo(-nhw, -nhh + r);
-            noteShape.quadraticCurveTo(-nhw, -nhh, -nhw + r, -nhh);
-            gNote = new T.ExtrudeGeometry(noteShape, {
-                depth: ND, bevelEnabled: false,
-            });
-            gNote.translate(0, 0, -ND / 2);  // center on Z
-            gSus     = new T.BoxGeometry(1, 1, 1);
-            gBeat    = new T.BufferGeometry().setFromPoints(
+            // Rectangular note geometry
+            gNote = new T.BoxGeometry(NW, NH, ND);
+
+            gSus  = new T.BoxGeometry(1, 1, 1);
+            gBeat = new T.BufferGeometry().setFromPoints(
                 [new T.Vector3(0, 0, 0), new T.Vector3(1, 0, 0)],
             );
 
-            mStr  = S_COL.map(c => new T.MeshLambertMaterial({ color: c }));
-            mGlow = S_COL.map(c =>
-                new T.MeshLambertMaterial({
-                    color: 0xffffff,
-                    emissive: c,
-                    emissiveIntensity: 0.7,
-                }),
-            );
-            mSus = S_COL.map(c =>
-                new T.MeshLambertMaterial({
-                    color: c,
-                    transparent: true,
-                    opacity: 0.35,
-                }),
-            );
+            // String materials: emissive so they glow when lit
+            mStr  = S_COL.map(c => new T.MeshStandardMaterial({
+                color: c, emissive: c, emissiveIntensity: 0.002,
+                transparent: true, opacity: 0.4, roughness: 1,
+            }));
+            mGlow = S_COL.map(c => new T.MeshLambertMaterial({
+                color: 0xffffff, emissive: c, emissiveIntensity: 1.5,
+            }));
+            mProj = S_COL.map(c => new T.MeshStandardMaterial({
+                color: c, emissive: c, emissiveIntensity: 0.002,
+                transparent: true, opacity: 0.15, roughness: 1,
+            }));
+            mProjGlow = S_COL.map(c => new T.MeshLambertMaterial({
+                color: 0xffffff, emissive: c, emissiveIntensity: 1.5,
+                transparent: true, opacity: 0.1,
+            }));
+            _laneTargetColor = new T.Color(0x4488ff);
+            mSus = S_COL.map(c => new T.MeshLambertMaterial({
+                color: c, transparent: true, opacity: 0.35,
+            }));
+            mWhiteOutline = new T.MeshLambertMaterial({ color: 0xffffff, emissive: 0xffffff, emissiveIntensity: 0.6 });
+            mSusOutline   = new T.MeshLambertMaterial({ color: 0xffffff, emissive: 0xffffff, emissiveIntensity: 0.3, transparent: true, opacity: 0.75, depthWrite: false });
+            mBeatM = new T.LineBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.25 });
+            mBeatQ = new T.LineBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.07 });
 
-            mBeatM = new T.LineBasicMaterial({
-                color: 0xffffff,
-                transparent: true,
-                opacity: 0.25,
+            // ── Projection meshes — one per string, own material clone each ──
+            projMeshArr = S_COL.map((_, s) => {
+                const m = new T.Mesh(gNote, mProj[s].clone());
+                m.visible = false;
+                noteG.add(m);
+                return m;
             });
-            mBeatQ = new T.LineBasicMaterial({
-                color: 0xffffff,
-                transparent: true,
-                opacity: 0.07,
+            projGlowArr = S_COL.map((_, s) => {
+                const m = new T.Mesh(gNote, mProjGlow[s].clone());
+                m.visible = false;
+                m.renderOrder = -1;
+                noteG.add(m);
+                return m;
             });
 
-            pNote  = pool(noteG, () => new T.Mesh(gNote, mStr[0]));
-            pSus   = pool(noteG, () => new T.Mesh(gSus,  mSus[0]));
-            pLbl   = pool(lblG,  () => new T.Sprite(txtMat('0', '#fff', false)));
-            pBeat  = pool(beatG, () => new T.Line(gBeat, mBeatQ));
-            pSec   = pool(lblG, () => new T.Sprite(txtMat('', '#0dd', true)));
+            // ── Pools ──────────────────────────────────────────────────────
+            pNote       = pool(noteG, () => new T.Mesh(gNote, mStr[0]));
+            pSus        = pool(noteG, () => new T.Mesh(gSus, mSus[0]));
+            pSusOutline = pool(noteG, () => new T.Mesh(gSus, mSusOutline));
+            pLbl  = pool(lblG,  () => new T.Sprite(txtMat('0', '#fff', false)));
+            pBeat = pool(beatG, () => new T.Line(gBeat, mBeatQ));
+            pSec  = pool(lblG,  () => new T.Sprite(txtMat('', '#0dd', true)));
 
-            // Chord bracket pieces (all #50a0dc)
-            mChord = new T.MeshBasicMaterial({ color: 0x50a0dc });
-            const barThick = 1 * K;  // bar/stem thickness
-            // Bar: unit-width box, scaled in X per chord
-            const gChBarGeo = new T.BoxGeometry(1, barThick, ND * 0.5);
-            pChBar = pool(noteG, () => new T.Mesh(gChBarGeo, mChord));
-            // Stem: unit-height box, scaled in Y per stem
-            const gChStemGeo = new T.BoxGeometry(barThick, 1, ND * 0.5);
-            pChStem = pool(noteG, () => new T.Mesh(gChStemGeo, mChord));
+            // Dynamic fret number labels (heat-coloured, updated each frame)
+            pFretLbl = pool(lblG, () => new T.Sprite(txtMat('0', '#888', false)));
+
+            // Highlight lane plane over active fret range
+            pLane = pool(noteG, () => new T.Mesh(
+                new T.PlaneGeometry(1, 1),
+                new T.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0, depthWrite: false }),
+            ));
+
+            // Vertical fret dividers within active lane
+            const gLaneDivider = new T.BoxGeometry(0.15 * K, 0.15 * K, 1);
+            const mLaneDivider = new T.MeshBasicMaterial({
+                color: 0xffffff, transparent: true, opacity: 0.08, fog: false, depthWrite: false,
+            });
+            pLaneDivider = pool(noteG, () => new T.Mesh(gLaneDivider, mLaneDivider));
+
+            // Chord frame-boxes (replaces old bracket approach)
+            pChordBox = pool(noteG, () => new T.Mesh(
+                new T.BoxGeometry(1, 1, 1),
+                new T.MeshStandardMaterial({
+                    color: 0x88ccff, transparent: true, opacity: 0.12,
+                    depthWrite: false, side: T.DoubleSide, metalness: 0.5, roughness: 0.2,
+                }),
+            ));
+
+            pChordLbl   = pool(lblG,  () => new T.Sprite(txtMat('', '#e8d080', true).clone()));
+            pBarreLine  = pool(noteG, () => new T.Mesh(
+                new T.BoxGeometry(1, 1, 1),
+                new T.MeshLambertMaterial({ color: 0xffffff, emissive: 0xffffff, emissiveIntensity: 0.9, transparent: true, depthWrite: false }),
+            ));
+
+            // Per-note fret number below note with connector line
+            pNoteFretLabel = pool(lblG, () => new T.Sprite(txtMat('0', '#ffffff', false).clone()));
+            pConnectorLine = pool(noteG, () => new T.Line(
+                new T.BufferGeometry().setFromPoints([new T.Vector3(0, 0, 0), new T.Vector3(0, 1, 0)]),
+                new T.LineBasicMaterial({ color: 0xaaaaaa, transparent: true, opacity: 0.5 }),
+            ));
+            pDropLine = pool(noteG, () => new T.Line(
+                new T.BufferGeometry().setFromPoints([new T.Vector3(0, 0, 0), new T.Vector3(0, 1, 0)]),
+                new T.LineBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.35 }),
+            ));
 
             buildBoard();
             return true;
         }
 
-        /* ── Fretboard (static geometry) ──────────────────────────── */
+        /* ── Fretboard (static geometry) ────────────────────────────────── */
         function buildBoard() {
-            // Dispose existing fretboard subtree before clearing.
-            // buildBoard runs at init AND whenever bundle.inverted
-            // toggles at runtime, so each rebuild would otherwise
-            // leak the removed strings/fret-wires/dots/plane —
-            // they're unreachable from teardown's scene.traverse
-            // once Group.remove has detached them.
+            // Dispose before clearing
             while (fretG.children.length) {
                 const child = fretG.children[0];
-                child.geometry?.dispose?.();
-                if (child.material) {
-                    if (Array.isArray(child.material)) {
-                        for (const m of child.material) m?.dispose?.();
-                    } else {
-                        child.material.dispose?.();
-                    }
+                if (child.material && !Array.isArray(child.material) &&
+                    !(child instanceof T.Sprite)) {
+                    child.geometry?.dispose?.();
+                    child.material.dispose?.();
                 }
                 fretG.remove(child);
             }
+            stringLines = [];
 
             const bw = fretX(NFRETS) + 4 * K;
             const bl = TS * (AHEAD + BEHIND);
 
-            // Dark fretboard plane
+            // Fretboard plane
             const pg = new T.PlaneGeometry(bw, bl);
-            const pm = new T.MeshLambertMaterial({
-                color: 0x10101a,
-                transparent: true,
-                opacity: 0.85,
-            });
-            const p = new T.Mesh(pg, pm);
+            const pm = new T.MeshLambertMaterial({ color: 0x08080e, transparent: true, opacity: 0.6 });
+            const p  = new T.Mesh(pg, pm);
             p.rotation.x = -Math.PI / 2;
             p.position.set(bw / 2 - 2 * K, S_BASE - NH / 2 - 2 * K, -bl / 2 + TS * BEHIND);
             fretG.add(p);
 
-            // Colored strings across fretboard at Z = 0
-            for (let s = 0; s < NSTR; s++) {
-                const g = new T.BufferGeometry().setFromPoints([
-                    new T.Vector3(-2 * K, sY(s), 0),
-                    new T.Vector3(fretX(NFRETS) + 2 * K, sY(s), 0),
-                ]);
-                fretG.add(
-                    new T.Line(
-                        g,
-                        new T.LineBasicMaterial({
-                            color: S_COL[s],
-                            transparent: true,
-                            opacity: 0.5,
-                        }),
-                    ),
-                );
+            // Thin Line strings (glow layer)
+            for (let s = 0; s < nStr; s++) {
+                const pts = [new T.Vector3(-2 * K, sY(s), 0), new T.Vector3(fretX(NFRETS) + 2 * K, sY(s), 0)];
+                const g   = new T.BufferGeometry().setFromPoints(pts);
+                fretG.add(new T.Line(g, new T.LineBasicMaterial({ color: S_COL[s], transparent: true, opacity: 0.15 })));
             }
 
-            // Fret wires at Z = 0. Span from the visually top-most
-            // string to below the bottom-most, so the board still
-            // spans the full string range under inversion — sY(NSTR-1)
-            // is only the visual top when NOT inverted.
-            const yTop = Math.max(sY(0), sY(NSTR - 1));
-            const yBottom = Math.min(sY(0), sY(NSTR - 1));
+            // BoxGeometry strings — emissive glow driven by updateStringHighlights()
+            const strLen = fretX(NFRETS) + 4 * K;
+            for (let s = 0; s < nStr; s++) {
+                const g = new T.BoxGeometry(strLen, STR_THICK, STR_THICK);
+                // Each string gets its own material instance so emissiveIntensity is per-string
+                const mat = new T.MeshStandardMaterial({
+                    color: S_COL[s], emissive: S_COL[s],
+                    emissiveIntensity: 0.002,
+                    transparent: true, opacity: 0.4, roughness: 1,
+                });
+                const mesh = new T.Mesh(g, mat);
+                mesh.position.set(strLen / 2 - 2 * K, sY(s), 0);
+                fretG.add(mesh);
+                stringLines.push(mesh);
+            }
+
+            // Fret wires
+            const yTop    = Math.max(sY(0), sY(nStr - 1));
+            const yBottom = Math.min(sY(0), sY(nStr - 1));
             for (let f = 0; f <= NFRETS; f++) {
-                const x = fretX(f);
+                const x      = fretX(f);
+                const isMain = DOTS.includes(f);
                 const g = new T.BufferGeometry().setFromPoints([
-                    new T.Vector3(x, yBottom - NH / 2 - 1 * K, 0),
-                    new T.Vector3(x, yTop + 1 * K, 0),
+                    new T.Vector3(x, yBottom - S_GAP * 0.3, 0),
+                    new T.Vector3(x, yTop    + S_GAP * 0.3, 0),
                 ]);
-                fretG.add(
-                    new T.Line(
-                        g,
-                        new T.LineBasicMaterial({
-                            color: 0x444466,
-                            transparent: true,
-                            opacity: 0.35,
-                        }),
-                    ),
-                );
+                fretG.add(new T.Line(g, new T.LineBasicMaterial({
+                    color: isMain ? 0xbbbbff : 0x666688,
+                    transparent: true,
+                    opacity: isMain ? 0.8 : 0.4,
+                })));
             }
 
             // Fret dots
             const dg = new T.SphereGeometry(1.5 * K, 8, 6);
             const dm = new T.MeshBasicMaterial({ color: 0x556677 });
-            const my = (sY(0) + sY(NSTR - 1)) / 2;
+            const my = (sY(0) + sY(nStr - 1)) / 2;
             for (const f of DOTS) {
                 const cx = fretMid(f);
                 if (DDOTS.has(f)) {
-                    let d = new T.Mesh(dg, dm);
-                    d.position.set(cx, my - S_GAP * 0.7, 0);
-                    fretG.add(d);
-                    d = new T.Mesh(dg, dm);
-                    d.position.set(cx, my + S_GAP * 0.7, 0);
-                    fretG.add(d);
+                    let d = new T.Mesh(dg, dm); d.position.set(cx, my - S_GAP * 0.7, 0); fretG.add(d);
+                    d = new T.Mesh(dg, dm);     d.position.set(cx, my + S_GAP * 0.7, 0); fretG.add(d);
                 } else {
-                    const d = new T.Mesh(dg, dm);
-                    d.position.set(cx, my, 0);
-                    fretG.add(d);
+                    const d = new T.Mesh(dg, dm); d.position.set(cx, my, 0); fretG.add(d);
                 }
             }
         }
 
-        /* ── Per-frame rendering (reads from bundle) ──────────────── */
+        /* ── String glow (called each frame) ────────────────────────────── */
+        function updateStringHighlights(noteState) {
+            const BASE_GLOW  = 0.02;
+            const MAX_GLOW   = 3.5;
+            const IDLE_OP    = 0.4;
+
+            for (let s = 0; s < nStr; s++) {
+                const mesh = stringLines[s];
+                if (!mesh) continue;
+                const intensity = Math.max(
+                    noteState.stringSustain[s] ? 1 : 0,
+                    noteState.stringAnticipation[s] || 0,
+                );
+                mesh.material.emissiveIntensity = BASE_GLOW + intensity * MAX_GLOW;
+                mesh.material.opacity           = IDLE_OP   + intensity * (1 - IDLE_OP);
+                mesh.scale.set(1, 1 + intensity * 0.3, 1 + intensity * 0.3);
+            }
+        }
+
+        /* ── Per-frame rendering ─────────────────────────────────────────── */
         function update(bundle) {
-            pNote.reset();
-            pSus.reset();
-            pLbl.reset();
-            pBeat.reset();
-            pSec.reset();
-            pChBar.reset();
-            pChStem.reset();
+            pNote.reset(); pSus.reset(); pSusOutline.reset(); pLbl.reset();
+            pBeat.reset(); pSec.reset();
+            if (projMeshArr) for (const m of projMeshArr) m.visible = false;
+            if (projGlowArr) for (const m of projGlowArr) m.visible = false;
+            pFretLbl.reset(); pLane.reset(); pLaneDivider.reset();
+            pChordBox.reset(); pChordLbl.reset(); pBarreLine.reset(); pNoteFretLabel.reset(); pConnectorLine.reset(); pDropLine.reset();
 
             const now = bundle.currentTime;
-            const t0 = now - BEHIND;
-            const t1 = now + AHEAD;
-            const tCam = t1;  // use full window for stable camera targeting
+            const t0  = now - BEHIND;
+            const t1  = now + AHEAD;
 
-            // Bundle's filter-aware arrays — no more highway.get* calls.
             const notes    = bundle.notes;
             const chords   = bundle.chords;
             const beats    = bundle.beats;
             const sections = bundle.sections;
 
-            let fMin = 99, fMax = 0, got = false;
+            // ── Frame state ───────────────────────────────────────────────
+            const noteState = {
+                stringSustain:    new Array(nStr).fill(false),
+                stringAnticipation: new Array(nStr).fill(0),
+                fretHeat:         new Array(NFRETS + 1).fill(0),
+                strGlow:          new Array(nStr).fill(0.5),
+            };
 
-            /* ── single notes ── */
+            // Compute sustain / anticipation / fret heat / per-string glow
             if (notes) {
                 for (const n of notes) {
-                    if (n.t + (n.sus || 0) < t0 || n.t > t1) continue;
-                    drawNote(n, now);
-                    // Camera targeting: only track notes in the near window
-                    if (n.f > 0 && n.t <= tCam) {
-                        fMin = Math.min(fMin, n.f);
-                        fMax = Math.max(fMax, n.f);
-                        got = true;
+                    const dt     = n.t - now;
+                    const susEnd = n.t + (n.sus || 0);
+                    if (dt > 0 && dt < 0.6)
+                        noteState.stringAnticipation[n.s] = Math.max(noteState.stringAnticipation[n.s], 1 - dt / 0.6);
+                    if (n.f > 0) {
+                        if (now >= n.t && now <= susEnd) noteState.fretHeat[n.f] = 1;
+                        else if (n.t > now) noteState.fretHeat[n.f] = Math.max(noteState.fretHeat[n.f], Math.max(0, 1 - dt / 2));
+                    }
+                    if (now >= n.t && now <= susEnd) noteState.stringSustain[n.s] = true;
+                    const sustained = dt < 0 && (n.sus || 0) > 0 && now <= susEnd;
+                    const hitDist = Math.abs(dt);
+                    if (hitDist < 0.15 || sustained) {
+                        const hitFade = sustained ? 0.7 : (1 - hitDist / 0.15);
+                        noteState.strGlow[n.s] = Math.max(noteState.strGlow[n.s], 1.0 + hitFade * 1.5);
                     }
                 }
             }
-
-            /* ── chords ── */
             if (chords) {
                 for (const ch of chords) {
-                    if (!ch.notes?.length) continue;
-                    // Max sustain across the chord's notes. Simple loop
-                    // (vs. Math.max(...map)) — no per-frame array
-                    // allocation in the hot path.
-                    let mxs = 0;
-                    for (const n of ch.notes) {
-                        const sus = n.sus || 0;
-                        if (sus > mxs) mxs = sus;
-                    }
-                    if (ch.t + mxs < t0 || ch.t > t1) continue;
-
-                    // Track the visually highest Y among chord notes
-                    // for the bracket's bar position. Using sY(max(s))
-                    // would be wrong under inversion because the
-                    // numerically largest string index is the visual
-                    // BOTTOM there; using the visual Y extent works
-                    // in both orientations.
-                    let maxNoteY = -Infinity;
-
-                    // Find center X of fretted notes (for open string
-                    // positioning). Single-pass scan over ch.notes —
-                    // avoids per-frame filter() allocation in the
-                    // hot path.
-                    let chordCX = curX;
-                    let cxL = Infinity, cxR = -Infinity;
-                    let frettedCount = 0;
+                    if (!ch.notes) continue;
+                    let maxSus = 0;
+                    for (const n of ch.notes) if ((n.sus || 0) > maxSus) maxSus = n.sus;
+                    const susEnd = ch.t + maxSus;
+                    const dt     = ch.t - now;
                     for (const cn of ch.notes) {
+                        if (dt > 0 && dt < 0.6)
+                            noteState.stringAnticipation[cn.s] = Math.max(noteState.stringAnticipation[cn.s], 1 - dt / 0.6);
                         if (cn.f > 0) {
-                            const fx = fretMid(cn.f);
-                            if (fx < cxL) cxL = fx;
-                            if (fx > cxR) cxR = fx;
-                            frettedCount++;
+                            if (now >= ch.t && now <= susEnd) { noteState.fretHeat[cn.f] = 1; continue; }
+                            if (ch.t > now) noteState.fretHeat[cn.f] = Math.max(noteState.fretHeat[cn.f], Math.max(0, 1 - dt / 2));
                         }
                     }
-                    if (frettedCount > 0) {
-                        chordCX = (cxL + cxR) / 2;
+                    if (now >= ch.t && now <= susEnd)
+                        for (const cn of ch.notes) noteState.stringSustain[cn.s] = true;
+                    const sustained = dt < 0 && maxSus > 0 && now <= susEnd;
+                    const hitDist = Math.abs(dt);
+                    if (hitDist < 0.15 || sustained) {
+                        const hitFade = sustained ? 0.7 : (1 - hitDist / 0.15);
+                        for (const cn of ch.notes)
+                            noteState.strGlow[cn.s] = Math.max(noteState.strGlow[cn.s], 1.0 + hitFade * 1.5);
                     }
+                }
+            }
+
+            updateStringHighlights(noteState);
+            for (let s = 0; s < nStr; s++) mGlow[s].emissiveIntensity = noteState.strGlow[s];
+
+            // ── Next-note-by-string lookahead (for anticipation projection) ──
+            const nextNoteByString = new Array(nStr).fill(null);
+            if (notes) {
+                for (const n of notes) {
+                    if (n.t <= now) continue;
+                    if (!nextNoteByString[n.s] || n.t < nextNoteByString[n.s].t) nextNoteByString[n.s] = n;
+                    if (n.f > 0 && n.t > now - 0.1 && n.t < now + 2) fretLastActiveTime[n.f] = now;
+                }
+            }
+            if (chords) {
+                for (const ch of chords) {
+                    if (!ch.notes || ch.t <= now) continue;
+                    for (const cn of ch.notes) {
+                        if (!nextNoteByString[cn.s] || ch.t < nextNoteByString[cn.s].t)
+                            nextNoteByString[cn.s] = { ...cn, t: ch.t };
+                        if (cn.f > 0 && ch.t > now - 0.1 && ch.t < now + 2) fretLastActiveTime[cn.f] = now;
+                    }
+                }
+            }
+
+            // Active frets (notes in cooldown window) + highway intensity
+            const activeFrets = new Set();
+            let highwayIntensity = 0;
+            for (let f = 1; f <= NFRETS; f++) {
+                if (now - fretLastActiveTime[f] < FRET_COOLDOWN) activeFrets.add(f);
+            }
+
+            // Camera targeting
+            let fMin = 99, fMax = 0, got = false;
+
+            // ── Single notes ──────────────────────────────────────────────
+            const lastFretForString = new Array(nStr).fill(undefined);
+            if (notes) {
+                for (const n of notes) {
+                    if (n.f > 0 && n.t > now && n.t < now + 2) activeFrets.add(n.f);
+                    if (n.t > now) {
+                        const dt = n.t - now;
+                        if (dt < AHEAD) highwayIntensity = Math.max(highwayIntensity, 1 - dt / AHEAD);
+                    }
+                    if (n.t + (n.sus || 0) < t0 || n.t > t1) continue;
+                    const isNext      = nextNoteByString[n.s] && Math.abs(nextNoteByString[n.s].t - n.t) < 0.001;
+                    const skipLabel   = lastFretForString[n.s] === n.f;
+                    drawNote(n, now, undefined, isNext, skipLabel, false);
+                    lastFretForString[n.s] = n.f;
+                    if (n.f > 0 && n.t <= t1) { fMin = Math.min(fMin, n.f); fMax = Math.max(fMax, n.f); got = true; }
+                }
+            }
+
+            // ── Chords ────────────────────────────────────────────────────
+            if (chords) {
+                let prevChordSig  = null;
+                let prevChordTime = -1;
+
+                for (const ch of chords) {
+                    if (!ch.notes) continue;
+                    if (ch.t > now) {
+                        const dt = ch.t - now;
+                        if (dt < AHEAD) highwayIntensity = Math.max(highwayIntensity, 1 - dt / AHEAD);
+                    }
+                    if (ch.t > now && ch.t < now + 2)
+                        for (const cn of ch.notes) { if (cn.f > 0) activeFrets.add(cn.f); }
+
+                    let maxSus = 0;
+                    for (const n of ch.notes) if ((n.sus || 0) > maxSus) maxSus = n.sus;
+                    if (ch.t + maxSus < t0 || ch.t > t1) continue;
+
+                    // Repeat-chord detection (consecutive same shape)
+                    const currentSig = ch.notes.slice().sort((a, b) => a.s - b.s).map(n => `${n.s}:${n.f}`).join('|');
+                    const isRepeat   = prevChordSig === currentSig && Math.abs(ch.t - prevChordTime) < 0.5;
+                    prevChordSig  = currentSig;
+                    prevChordTime = ch.t;
+
+                    // Open-string center X
+                    let chordCX = curX;
+                    let cxL = Infinity, cxR = -Infinity, fretted = 0;
+                    for (const cn of ch.notes) {
+                        if (cn.f > 0) { const fx = fretMid(cn.f); if (fx < cxL) cxL = fx; if (fx > cxR) cxR = fx; fretted++; }
+                    }
+                    if (fretted > 0) chordCX = (cxL + cxR) / 2;
 
                     for (const cn of ch.notes) {
-                        drawNote(
-                            {
-                                t: ch.t, s: cn.s, f: cn.f,
-                                sus: cn.sus || 0, bn: cn.bn,
-                                ho: cn.ho, po: cn.po,
-                                sl: cn.sl, pm: cn.pm,
-                                ac: cn.ac, tp: cn.tp,
-                                hm: cn.hm, hp: cn.hp,
-                                tr: cn.tr,
-                            },
-                            now,
-                            cn.f === 0 ? chordCX : undefined,
-                        );
-                        const ny = sY(cn.s);
-                        if (ny > maxNoteY) maxNoteY = ny;
-                        if (cn.f > 0 && ch.t <= tCam) {
-                            fMin = Math.min(fMin, cn.f);
-                            fMax = Math.max(fMax, cn.f);
-                            got = true;
-                        }
+                        const isNext    = nextNoteByString[cn.s] && Math.abs(nextNoteByString[cn.s].t - ch.t) < 0.001;
+                        const skipLabel = lastFretForString[cn.s] === cn.f;
+                        drawNote({ ...cn, t: ch.t, sus: cn.sus || 0 }, now, cn.f === 0 ? chordCX : undefined, isNext, skipLabel, isRepeat, 0.55);
+                        lastFretForString[cn.s] = cn.f;
+                        if (cn.f > 0 && ch.t <= t1) { fMin = Math.min(fMin, cn.f); fMax = Math.max(fMax, cn.f); got = true; }
                     }
 
-                    // Chord bracket: horizontal bar + vertical stems (L-corners)
-                    // Hide bracket once chord has crossed the strings
+                    // Chord frame-box
                     const chDt = ch.t - now;
-                    if (ch.notes.length > 1 && chDt > -0.05) {
-                        const cz = dZ(chDt);
-                        const barY = maxNoteY + S_GAP * 0.6;
+                    if (ch.notes.length > 1 && chDt > -0.55 && chDt < AHEAD) {
+                        const z = Math.min(0, dZ(chDt));
+                        let fMinCh = 99, fMaxCh = 0;
+                        for (const cn of ch.notes) { if (cn.f > 0) { fMinCh = Math.min(fMinCh, cn.f); fMaxCh = Math.max(fMaxCh, cn.f); } }
+                        if (fMinCh < 99) {
+                            const xLeft  = fretX(fMinCh - 1);
+                            const xRight = fretX(Math.max(fMaxCh, fMinCh + 2));
+                            const padX   = NW * 0.4;
+                            const width  = (xRight - xLeft) + padX * 2;
+                            const cx     = xLeft + width / 2 - padX;
+                            const yA     = sY(0), yB = sY(nStr - 1);
+                            const yMinF  = Math.min(yA, yB) - S_GAP * 0.8;
+                            const yMaxF  = Math.max(yA, yB) + S_GAP * 0.8;
+                            let   height = yMaxF - yMinF;
+                            if (isRepeat) height *= 0.5;
+                            const cY     = (yMinF + yMaxF) / 2;
+                            const fade   = Math.max(0, 1 - chDt / AHEAD);
+                            const baseOp = isRepeat ? 0.05 + fade * 0.1 : 0.12 + fade * 0.2;
+                            const thick  = 0.25 * K;
+                            const drawEdge = (px, py, sx, sy) => {
+                                const b = pChordBox.get(); b.position.set(px, py, z); b.scale.set(sx, sy, thick); b.material.opacity = baseOp;
+                            };
+                            drawEdge(cx - width / 2, cY, thick, height); // left
+                            drawEdge(cx + width / 2, cY, thick, height); // right
+                            drawEdge(cx, cY - height / 2, width, thick); // bottom
+                            drawEdge(cx, cY + height / 2, width, thick); // top
+                            const fill = pChordBox.get();
+                            fill.position.set(cx, cY, z); fill.scale.set(width, height, thick * 0.5);
+                            fill.material.opacity = isRepeat ? 0.02 : 0.04;
 
-                        // Find X extents (open strings use chord center)
-                        let xMin = Infinity, xMax = -Infinity;
-                        for (const cn of ch.notes) {
-                            const nx = cn.f === 0 ? chordCX : fretMid(cn.f);
-                            xMin = Math.min(xMin, nx);
-                            xMax = Math.max(xMax, nx);
-                        }
+                            const chordName = bundle.chordTemplates?.[ch.id]?.name;
+                            if (chordName) {
+                                const postFade = chDt < 0 ? Math.max(0, 1 + chDt / 0.55) : 1;
+                                const lblW = 28 * K, lblH = 9 * K;
+                                const lbl = pChordLbl.get();
+                                const mat = txtMat(chordName, '#e8d080', true);
+                                if (lbl.material.map !== mat.map) { lbl.material.map = mat.map; lbl.material.needsUpdate = true; }
+                                lbl.material.opacity = Math.min(1, 0.3 + fade * 0.7) * postFade;
+                                lbl.position.set((cx - width / 2) + lblW / 2, yMaxF + lblH / 2, z);
+                                lbl.scale.set(lblW, lblH, 1);
 
-                        // Bar spans exactly between outer stems (center to center)
-                        const barW = xMax - xMin;
-                        const bar = pChBar.get();
-                        bar.position.set(xMin + barW / 2, barY, cz);
-                        bar.scale.set(barW, 1, 1);
-
-                        // Vertical stems drop from bar bottom to note top
-                        for (const cn of ch.notes) {
-                            const nx = cn.f === 0 ? chordCX : fretMid(cn.f);
-                            const noteTop = sY(cn.s) + NH * 0.5;
-                            const stemH = barY - noteTop;
-                            if (stemH <= 0) continue;
-                            const stem = pChStem.get();
-                            stem.position.set(nx, noteTop + stemH / 2, cz);
-                            stem.scale.set(1, stemH, 1);
+                                if (/barre/i.test(chordName) && chDt <= 0) {
+                                    let bFret = Infinity;
+                                    for (const cn of ch.notes) if (cn.f > 0) bFret = Math.min(bFret, cn.f);
+                                    if (bFret < Infinity) {
+                                        const bx    = fretMid(bFret);
+                                        const yTop  = Math.max(sY(0), sY(nStr - 1));
+                                        const yBot  = Math.min(sY(0), sY(nStr - 1));
+                                        const lineH = yTop - yBot;
+                                        const postFadeB = Math.max(0, 1 + chDt / 0.55);
+                                        const bl = pBarreLine.get();
+                                        bl.position.set(bx, (yTop + yBot) / 2, 0.05 * K);
+                                        bl.scale.set(0.5 * K, lineH, 0.5 * K);
+                                        bl.material.opacity = 0.8 * postFadeB;
+                                    }
+                                }
+                            }
                         }
                     }
                 }
             }
 
-            /* ── beat lines ── */
+            // ── Dynamic highway lane ──────────────────────────────────────
+            if (activeFrets.size > 0) {
+                let minF = 99, maxF = 0;
+                activeFrets.forEach(f => { if (f > 0) { minF = Math.min(minF, f); maxF = Math.max(maxF, f); } });
+                let dMin = minF - 1, dMax = maxF;
+                if (dMax - dMin < 4) {
+                    dMax = dMax + (3 - (dMax - dMin));
+                    if (dMax > NFRETS) { dMax = NFRETS; dMin = Math.max(0, dMax - 4); }
+                }
+                const xL     = fretX(dMin), xR = fretX(dMax);
+                const margin = NW * 0.5;
+                const laneW  = (xR - xL) + margin * 2;
+                const laneLen = TS * AHEAD;
+                const boardY = S_BASE - NH / 2 - 2 * K;
+                const lane   = pLane.get();
+                lane.position.set((xL + xR) / 2, boardY + 0.02 * K, -laneLen / 2 + TS * BEHIND);
+                lane.rotation.x = -Math.PI / 2;
+                lane.scale.set(laneW, laneLen, 1);
+                lane.material.opacity = 0.04 + highwayIntensity * 0.13;
+                lane.material.color.set(0x112233).lerp(_laneTargetColor, highwayIntensity);
+                lane.renderOrder = 1;
+
+                // Lane dividers (fret wires inside active range)
+                if (highwayIntensity > 0.05) {
+                    const divLen = TS * (AHEAD + BEHIND) * 0.6;
+                    const yPos   = boardY + 0.03 * K;
+                    for (let f = Math.floor(dMin); f <= Math.ceil(dMax); f++) {
+                        const div = pLaneDivider.get();
+                        div.position.set(fretX(f), yPos, dZ(0) - divLen * 0.5 + TS * BEHIND);
+                        div.scale.set(1, 1, divLen);
+                        div.material.opacity = 0.02 + highwayIntensity * 0.1;
+                        div.renderOrder = 2;
+                    }
+                }
+            }
+
+            // ── Dynamic fret number row (heat-coloured) ───────────────────
+            {
+                const yBottom = Math.min(sY(0), sY(nStr - 1));
+                for (let f = 1; f <= NFRETS; f++) {
+                    const lb       = pFretLbl.get();
+                    const isActive = activeFrets.has(f);
+                    lb.material    = txtMat(f, isActive ? '#ffe84d' : '#9ab8cc', false);
+                    lb.position.set(fretMid(f), yBottom - S_GAP * 0.6, 0.5 * K);
+                    const intensity = noteState.fretHeat[f];
+                    lb.material.opacity = 0.35 + intensity * 0.65;
+                    const scale = 3.5 + intensity * 2.2;
+                    lb.scale.set(scale * K, scale * K, 1);
+                }
+            }
+
+            // ── Beat lines ────────────────────────────────────────────────
             if (beats) {
-                const bw = fretX(NFRETS) + 4 * K;
+                const bw2 = fretX(NFRETS) + 4 * K;
                 let lastM = -1;
                 for (const b of beats) {
-                    const meas = b.measure !== lastM;
-                    lastM = b.measure;
+                    const meas = b.measure !== lastM; lastM = b.measure;
                     if (b.time < t0 || b.time > t1) continue;
-                    const bl = pBeat.get();
-                    bl.material = meas ? mBeatM : mBeatQ;
-                    bl.scale.set(bw, 1, 1);
-                    bl.position.set(-2 * K, S_BASE - NH / 2 - 1.5 * K, dZ(b.time - now));
+                    const bl2 = pBeat.get();
+                    bl2.material = meas ? mBeatM : mBeatQ;
+                    bl2.scale.set(bw2, 1, 1);
+                    bl2.position.set(-2 * K, S_BASE - NH / 2 - 1.5 * K, dZ(b.time - now));
                 }
             }
 
-            /* ── section labels ── */
+            // ── Section labels ────────────────────────────────────────────
             if (sections) {
-                // Anchor above the visually topmost string, not a
-                // fixed string index — `sY(NSTR - 1)` is only the top
-                // when not inverted. Using Math.max(sY(0), sY(NSTR-1))
-                // keeps labels above the fretboard in both
-                // orientations.
-                const labelY = Math.max(sY(0), sY(NSTR - 1)) + 8 * K;
+                const labelY = Math.max(sY(0), sY(nStr - 1)) + 8 * K;
                 for (const s of sections) {
                     if (s.time < t0 || s.time > t1) continue;
                     const sp = pSec.get();
                     sp.material = txtMat(s.name, '#00cccc', true);
                     sp.scale.set(20 * K, 5 * K, 1);
-                    sp.position.set(
-                        fretX(12),
-                        labelY,
-                        dZ(s.time - now),
-                    );
+                    sp.position.set(fretX(12), labelY, dZ(s.time - now));
                 }
             }
 
-            /* ── camera target ── */
+            // ── Camera target ─────────────────────────────────────────────
             if (got) {
-                tgtX = fretMid(Math.round((fMin + fMax) / 2));
-                // Dynamic camera distance based on fret span (ChartPlayer formula)
-                const fretSpan = fMax - fMin;
-                tgtDist = (65 + Math.max(fretSpan, 4) * 3) * K;
+                tgtX   = fretMid(Math.round((fMin + fMax) / 2));
+                tgtDist = (65 + Math.max(fMax - fMin, 4) * 3) * K;
+            }
+
+            // ── Chord diagram: track most recently hit chord in linger window ─
+            _diagChord = null;
+            if (chords) {
+                let bestT = -Infinity;
+                for (const ch of chords) {
+                    if (!ch.notes) continue;
+                    const chDt = ch.t - now;
+                    if (chDt <= 0 && chDt > -0.55) {
+                        const tmpl = bundle.chordTemplates?.[ch.id];
+                        if (tmpl?.name && tmpl?.frets && ch.t > bestT) {
+                            bestT = ch.t;
+                            _diagChord = { name: tmpl.name, frets: tmpl.frets, chDt };
+                        }
+                    }
+                }
             }
         }
 
-        function drawNote(n, now, openX) {
-            const s  = n.s;
-            const dt = n.t - now;           // negative = past the string
-            const y  = sY(s);
+        /* ── Note renderer ───────────────────────────────────────────────── */
+        // skipLabel: don't draw per-note connector label (repeated fret)
+        // skipBody:  don't draw the 3D note mesh (repeat chord — still shows projection)
+        function drawNote(n, now, openX, isNext, skipLabel, skipBody, linger = 0.05) {
+            const s      = n.s;
+            const dt     = n.t - now;
+            const y      = sY(s);
             const susEnd = n.t + (n.sus || 0);
             const hasSus = n.sus > 0;
+            if (dt < -linger && (!hasSus || now > susEnd)) return;
 
-            // Destroy: non-sustained notes vanish after crossing, sustained notes after sustain ends
-            if (dt < -0.05 && (!hasSus || now > susEnd)) return;
-
-            // Is the note currently being sustained? (past the string, sustain still active)
             const sustained = dt < 0 && hasSus && now <= susEnd;
-            // Approaching / at the string
-            const hitDist = Math.abs(dt);
-            const hit = hitDist < 0.15 || sustained;
-            const hitFade = sustained ? 0.7 : (hitDist < 0.15 ? 1 - hitDist / 0.15 : 0);
+            const hitDist   = Math.abs(dt);
+            const hit       = hitDist < 0.15 || sustained;
+            const hitFade   = sustained ? 0.7 : (hitDist < 0.15 ? 1 - hitDist / 0.15 : 0);
+            const vibrato   = sustained ? Math.sin(now * 30) * 0.3 * K : 0;
+            const noteZ     = sustained ? 0 : Math.min(0, dZ(dt));
+            const x         = n.f === 0 ? (openX !== undefined ? openX : curX) : fretMid(n.f);
+            const isHarm    = n.hm || n.hp;
 
-            // Sustained notes pin to Z=0 (the string) with vibrato
-            const vibrato = sustained ? Math.sin(now * 30) * 0.3 * K : 0;
-            const noteZ = sustained ? 0 : dZ(dt);
+            if (!skipBody) {
+                // Rotate from vertical (π/2) when entering to horizontal (0) at the hit line; skip for open strings
+                const approachRot = n.f > 0 ? Math.max(0, Math.min(1, dt / AHEAD)) * Math.PI / 2 : 0;
 
-            if (n.f === 0) {
-                // Open string: wide horizontal bar centered on context or camera
-                const lineW = 40 * K;
-                const cx = openX !== undefined ? openX : curX;
-                const box = pNote.get();
-                // Reset rotation: pNote pool reuses meshes, and the
-                // fretted branch below sets rotation.z = π/4 for
-                // harmonics. Without this reset, an open-string bar
-                // drawn after a harmonic would inherit that rotation.
-                box.rotation.set(0, 0, 0);
-                box.material = hit ? mGlow[s] : mStr[s];
-                box.position.set(cx, y + vibrato, noteZ);
-                box.scale.set(lineW / NW, 0.3, 0.6);
+                // ── Outline (slightly larger, bright emissive) ────────────
+                const outline = pNote.get();
+                outline.material = mWhiteOutline;
+                outline.position.set(x, y + vibrato, noteZ);
+                outline.rotation.z = approachRot + (isHarm ? Math.PI / 4 : 0);
+                if (n.f === 0) {
+                    outline.scale.set((35 * K / NW) * 1.1, 0.1 * 1.1, 0.6 * 1.1);
+                } else {
+                    outline.scale.set(1.1, 1.1, 2.8);
+                }
 
-                // "0" label
-                const lb = pLbl.get();
-                lb.material = txtMat(0, hit ? '#fff' : '#ddd', false);
-                lb.scale.set(NW * 0.7, NH * 0.8, 1);
-                lb.position.set(cx, y + vibrato, noteZ + 0.01 * K);
+                // ── Core (filled note body) ───────────────────────────────
+                const core = pNote.get();
+                core.material = hit ? mGlow[s] : mStr[s];
+                core.position.set(x, y + vibrato, noteZ + 0.001);
+                core.rotation.z = approachRot + (isHarm ? Math.PI / 4 : 0);
+                if (n.f === 0) {
+                    core.scale.set(40 * K / NW, 0.1, 0.6);
+                } else {
+                    core.scale.set(1, 1, 2.5);
+                }
+                if (n.f === 0) {
+                    // "0" label on open string
+                    const lb = pLbl.get();
+                    lb.material = txtMat(0, hit ? '#fff' : '#ddd', false);
+                    lb.scale.set(NW * 0.7, NH * 0.8, 1);
+                    lb.position.set(x, y + vibrato, noteZ + 0.01 * K);
+                }
 
+                // ── Sustain trail ─────────────────────────────────────────
                 if (hasSus) {
-                    // Remaining sustain trail (shrinks as sustain is consumed)
                     const susStart = Math.max(n.t, now);
-                    const remSus = susEnd - susStart;
+                    const remSus   = susEnd - susStart;
                     if (remSus > 0.01) {
-                        const len = Math.min(remSus, AHEAD) * TS;
-                        const trZ = dZ((susStart - now)) - len / 2;
-                        const tr  = pSus.get();
+                        const len  = Math.min(remSus, AHEAD) * TS;
+                        const zPos = dZ(susStart - now) - len / 2;
+                        const tw   = NW * 0.85, th = NH * 0.12;
+                        const trOut = pSusOutline.get();
+                        trOut.position.set(x, y, zPos);
+                        trOut.scale.set(tw + 0.4 * K, th + 0.4 * K, len);
+                        const tr = pSus.get();
                         tr.material = mSus[s];
-                        tr.position.set(cx, y, trZ);
-                        tr.scale.set(SW, SH, len);
+                        tr.position.set(x, y, zPos);
+                        tr.scale.set(tw, th, len);
                     }
                 }
-                return;
-            }
 
-            const x = fretMid(n.f);
-            const isHarmonic = n.hm || n.hp;
+                // ── Lane drop line (anchors note to its lane) ─────────────
+                if (dt > 0) {
+                    const boardY  = S_BASE - NH / 2 - 2 * K;
+                    const lineTop = y - NH / 2 - NH * 0.4;
+                    const lineBot = boardY + NH * 0.5;
+                    const lineLen = lineTop - lineBot;
+                    if (lineLen > 0.001) {
+                        const dl = pDropLine.get();
+                        dl.material.color.set(S_COL[s]);
+                        dl.position.set(x, lineBot, noteZ);
+                        dl.scale.set(1, lineLen, 1);
+                    }
+                }
 
-            // Note box — diamond rotation for harmonics, glow at string intersection
-            const box = pNote.get();
-            if (hit) {
-                box.material = mGlow[s];
-                mGlow[s].emissiveIntensity = 0.4 + hitFade * 0.6;
-            } else {
-                box.material = mStr[s];
-            }
-            box.position.set(x, y + vibrato, noteZ);
-            box.scale.set(1, 1, 1);
-            box.rotation.z = isHarmonic ? Math.PI / 4 : 0;
+                // ── Technique labels ──────────────────────────────────────
+                let yo = y + NH * 0.8;
+                if (n.bn > 0) {
+                    const l = pLbl.get();
+                    l.material = txtMat('↑' + bendText(n.bn), '#fff', true);
+                    l.scale.set(NH * 3.6, NH * 1.5, 1); l.position.set(x, yo, noteZ); yo += NH * 1.2;
+                }
+                if (n.sl && n.sl !== -1) {
+                    const l = pLbl.get();
+                    l.material = txtMat(n.sl > n.f ? '↗' : '↘', '#fff', false);
+                    l.scale.set(NH * 1.6, NH * 1.6, 1); l.position.set(x + NW * 0.6, yo, noteZ);
+                }
+                if (n.ho || n.po || n.tp) {
+                    const l = pLbl.get();
+                    l.material = txtMat(n.ho ? 'H' : n.po ? 'P' : 'T', '#fff', false);
+                    l.scale.set(NH * 1.5, NH * 1.5, 1); l.position.set(x + NW * 0.6, yo, noteZ);
+                }
+                if (n.ac) {
+                    const l = pLbl.get();
+                    l.material = txtMat('>', '#fff', false);
+                    l.scale.set(NH * 1.6, NH * 1.6, 1); l.position.set(x, yo, noteZ); yo += NH * 1.2;
+                }
+                if (n.tr) {
+                    const l = pLbl.get();
+                    l.material = txtMat('~~~', '#ff0', true);
+                    l.scale.set(NH * 3.0, NH * 1.2, 1); l.position.set(x, yo, noteZ);
+                }
+                if (n.pm) {
+                    // Palm mute: "X" overlay on the note body
+                    const pmMark = pLbl.get();
+                    if (!pmMark._pmMat) pmMark._pmMat = txtMat('X', '#ffffff', false).clone();
+                    pmMark.material = pmMark._pmMat;
+                    pmMark.position.set(x, y + vibrato, noteZ + 0.1 * K);
+                    const pmScale = NH * 1.35;
+                    pmMark.scale.set(pmScale, pmScale, 1);
+                    pmMark.material.opacity = hit ? 1.0 : 0.8;
+                }
+                if (n.hp) {
+                    const l = pLbl.get();
+                    l.material = txtMat('PH', '#ff0', true);
+                    l.scale.set(NH * 2.1, NH * 1.2, 1); l.position.set(x, y - NH * 1.1, noteZ);
+                }
 
-            // Fret number label
-            if (n.f > 0) {
-                const lb = pLbl.get();
-                lb.material = txtMat(n.f, hit ? '#fff' : '#ddd', false);
-                lb.scale.set(NW * 0.7, NH * 0.8, 1);
-                lb.position.set(x, y + vibrato, noteZ + 0.01 * K);
-            }
+                // ── Per-note fret connector label ─────────────────────────
+                if (n.f > 0 && !skipLabel) {
+                    const minStringY = Math.min(sY(0), sY(nStr - 1));
+                    const labelY     = minStringY - S_GAP * 0.8;
+                    // fade out in the last 0.5 s so it doesn't overlap the fret-row label at Z=0
+                    const alpha      = Math.max(0, Math.min(1, dt / 0.5)) * Math.min(1, (AHEAD - dt) / (AHEAD * 0.4));
 
-            // Sustain trail (shrinks as consumed)
-            if (hasSus) {
-                const susStart = Math.max(n.t, now);
-                const remSus = susEnd - susStart;
-                if (remSus > 0.01) {
-                    const len = Math.min(remSus, AHEAD) * TS;
-                    const trZ = dZ((susStart - now)) - len / 2;
-                    const tr  = pSus.get();
-                    tr.material = mSus[s];
-                    tr.position.set(x, y, trZ);
-                    tr.scale.set(SW, SH, len);
+                    const fretLabel  = pNoteFretLabel.get();
+                    const cachedMat  = txtMat(n.f, '#ffffff', false);
+                    if (fretLabel.material.map !== cachedMat.map) {
+                        fretLabel.material.map = cachedMat.map;
+                        fretLabel.material.needsUpdate = true;
+                    }
+                    fretLabel.position.set(x, labelY, noteZ);
+                    fretLabel.scale.set(NH * 2.2, NH * 2.2, 1);
+                    fretLabel.material.opacity = alpha;
+
+                    const line = pConnectorLine.get();
+                    line.position.set(x, labelY, noteZ);
+                    line.scale.set(1, y - labelY, 1);
+                    line.material.opacity = alpha * 0.8;
                 }
             }
 
-            // ── Technique indicators (matches highway.js) ──
+            // ── Board projection (ghost at Z=0, always drawn for isNext) ─
+            const PROJ_WIN   = 0.6;
+            const projFactor = Math.max(0, Math.min(1, 1 - dt / PROJ_WIN));
+            const isBlocked  = dt < 0.15 && n.sus > 0;
+            if (n.f > 0 && isNext && dt > 0 && dt < PROJ_WIN && projFactor > 0.05 && !isBlocked) {
+                const proj = projMeshArr[s];
+                proj.material.opacity = (skipBody ? 0.1 : 0.15) + projFactor * 0.6;
+                proj.position.set(x, y, 0.02);
+                proj.scale.set(1, 1, 1);
+                proj.rotation.z = isHarm ? Math.PI / 4 : 0;
+                proj.visible = true;
 
-            const hasBend = n.bn > 0;
-            let yo = y + NH * 0.8;
-
-            // Bend: arrow + amount (½, full, 1½, 2)
-            if (hasBend) {
-                const l = pLbl.get();
-                l.material = txtMat('↑' + bendText(n.bn), '#fff', true);
-                l.scale.set(NH * 3.6, NH * 1.5, 1);
-                l.position.set(x, yo, noteZ);
-                yo += NH * 1.2;
-            }
-
-            // Slide: diagonal arrow
-            if (n.sl && n.sl !== -1) {
-                const l = pLbl.get();
-                l.material = txtMat(
-                    n.sl > n.f ? '↗' : '↘', '#fff', false,
-                );
-                l.scale.set(NH * 1.6, NH * 1.6, 1);
-                l.position.set(x + NW * 0.6, yo, noteZ);
-            }
-
-            // Hammer-on / Pull-off / Tap
-            if (n.ho || n.po || n.tp) {
-                const label = n.ho ? 'H' : n.po ? 'P' : 'T';
-                const l = pLbl.get();
-                l.material = txtMat(label, '#fff', false);
-                l.scale.set(NH * 1.5, NH * 1.5, 1);
-                l.position.set(x + NW * 0.6, yo, noteZ);
-            }
-
-            // Accent: ">"
-            if (n.ac) {
-                const l = pLbl.get();
-                l.material = txtMat('>', '#fff', false);
-                l.scale.set(NH * 1.6, NH * 1.6, 1);
-                l.position.set(x, yo, noteZ);
-                yo += NH * 1.2;
-            }
-
-            // Tremolo: wavy yellow line
-            if (n.tr) {
-                const l = pLbl.get();
-                l.material = txtMat('~~~', '#ff0', true);
-                l.scale.set(NH * 3.0, NH * 1.2, 1);
-                l.position.set(x, yo, noteZ);
-            }
-
-            // ── Below note ──
-
-            // Palm mute
-            if (n.pm) {
-                const l = pLbl.get();
-                l.material = txtMat('PM', '#aaa', true);
-                l.scale.set(NH * 2.4, NH * 1.4, 1);
-                l.position.set(x, y - NH * 0.9, noteZ);
-            }
-
-            // Pinch harmonic label
-            if (n.hp) {
-                const l = pLbl.get();
-                l.material = txtMat('PH', '#ff0', true);
-                l.scale.set(NH * 2.1, NH * 1.2, 1);
-                l.position.set(x, y - NH * 1.1, noteZ);
+                const glow = projGlowArr[s];
+                glow.material.opacity = (0.05 + projFactor * 0.25) * (0.9 + Math.sin(now * 10) * 0.1);
+                glow.position.set(x, y, 0.019);
+                glow.scale.set(projFactor * 1.1, projFactor * 1.1, 1);
+                glow.rotation.z = isHarm ? Math.PI / 4 : 0;
+                glow.visible = true;
             }
         }
 
-        /* ── Camera smooth lerp (ChartPlayer FretCamera) ──────────── */
+        /* ── Camera smooth lerp ──────────────────────────────────────────── */
         function camUpdate(bundle) {
-            // Scale lerp by tempo: faster songs get faster camera response
-            const bpm = computeBPM(bundle.beats, bundle.currentTime);
+            const bpm  = computeBPM(bundle.beats, bundle.currentTime);
             const lerp = CAM_LERP_BASE * Math.max(bpm, 60) / 120;
-            curX += (tgtX - curX) * lerp;
+            curX    += (tgtX    - curX)    * lerp;
             curDist += (tgtDist - curDist) * lerp;
-            // Scale camera back for narrower viewports so fret coverage stays consistent
             const dist = curDist * aspectScale;
-            const h = CAM_H_BASE * (dist / CAM_DIST_BASE);
-            cam.position.set(curX, h, dist);
-            cam.lookAt(curX, sY(2.5), -FOCUS_D * 0.3);
+            const h    = CAM_H_BASE * (dist / CAM_DIST_BASE);
+            cam.position.set(curX + 20 * K, h * 0.95, dist * 0.75);
+
+            // Self-correcting look-at Y: project the fretboard's near-edge centre
+            // to NDC space. If it drifts toward the frame edge, nudge tgtLookY
+            // toward the fretboard centre so the camera tilts to re-frame it.
+            // This lets the camera adapt to any panel aspect ratio automatically.
+            const fretMidY = (sY(0) + sY(nStr - 1)) / 2;
+            _probe.set(curX, fretMidY, 0);                  // play-line fretboard centre
+            cam.lookAt(curX, curLookY, -FOCUS_D * 0.35);    // tentative look — needed for project()
+            cam.updateMatrixWorld();
+            _probe.project(cam);                             // _probe.y → NDC in [-1, 1]
+
+            // Keep fretboard centre in the lower third of the screen (NDC ≈ -0.35).
+            const DESIRED_NDC_Y = -0.35;
+            if (_probe.y < DESIRED_NDC_Y - 0.15 || _probe.y > DESIRED_NDC_Y + 0.15) {
+                // _probe.y too low → fretboard near bottom → tgtLookY decreases → camera tilts down → fretboard rises
+                // _probe.y too high → fretboard near top  → tgtLookY increases → camera tilts up   → fretboard drops
+                const correction = (DESIRED_NDC_Y - _probe.y) * fretMidY * 0.5;
+                tgtLookY = Math.max(-fretMidY, Math.min(fretMidY, tgtLookY - correction));
+            }
+            curLookY += (tgtLookY - curLookY) * lerp;
+
+            // Final look-at with the corrected Y (overrides the tentative one above)
+            cam.lookAt(curX, curLookY, -FOCUS_D * 0.35);
         }
 
-        /* ── Apply a canvas size to the Three.js renderer + wrap ─── */
+        /* ── Resize helper ───────────────────────────────────────────────── */
         function applySize(w, h) {
             if (!ren || !cam || !wrap) return;
-            // Guard against 0 / negative / non-finite dims — resize
-            // events can fire while the container is temporarily
-            // collapsed (e.g. mid-layout transition), and dividing by
-            // zero produces an Infinity aspect that wedges rendering.
             if (!Number.isFinite(w) || !Number.isFinite(h) || w <= 0 || h <= 0) return;
+            const baseDPR = _ssActive() ? Math.min(devicePixelRatio, 1.25) : Math.min(devicePixelRatio, 2);
+            ren.setPixelRatio(_renderScale * baseDPR);
             ren.setSize(w, h);
             wrap.style.height = h + 'px';
+            if (lyricsCanvas) { lyricsCanvas.width = w; lyricsCanvas.height = h; }
             cam.aspect = w / h;
             cam.updateProjectionMatrix();
-            // Narrower windows need the camera further back to show the same fret range
-            aspectScale = REF_ASPECT / Math.max(cam.aspect, 0.5);
+            aspectScale = Math.max(1, REF_ASPECT / Math.max(cam.aspect, 0.5));
         }
 
-        /* ── Teardown (release all GPU + DOM resources) ───────────── */
+        /* ── Teardown ────────────────────────────────────────────────────── */
         function teardown() {
-            if (wrap) {
-                wrap.remove();
-                wrap = null;
-            }
-            // Dispose scene resources BEFORE the renderer. three.js
-            // coordinates GPU cleanup via dispose-event listeners the
-            // renderer registers during setup; disposing the renderer
-            // first unregisters those listeners and leaves some GPU
-            // buffers resident even though geometry/material.dispose
-            // fires afterwards. scene.traverse catches the
-            // board-building meshes (string lines, fret wires, dot
-            // spheres, backing plane) — their geometries/materials
-            // aren't tracked anywhere else after buildBoard finishes.
+            if (wrap) { wrap.remove(); wrap = null; }
             if (scene) {
                 scene.traverse((obj) => {
-                    if (obj.geometry && typeof obj.geometry.dispose === 'function') {
-                        obj.geometry.dispose();
-                    }
+                    obj.geometry?.dispose?.();
                     if (obj.material) {
                         const mats = Array.isArray(obj.material) ? obj.material : [obj.material];
-                        for (const m of mats) {
-                            m.map?.dispose?.();
-                            m.dispose?.();
-                        }
+                        for (const m of mats) { m.map?.dispose?.(); m.dispose?.(); }
                     }
                 });
             }
-            // Explicit dispose of geometries held directly in closure
-            // (the pooled templates). Some are also reached via the
-            // traverse above through the pool's children, but disposing
-            // twice is safe — three.js guards against it.
-            gNote?.dispose?.();
-            gSus?.dispose?.();
-            gBeat?.dispose?.();
-            // Pool / per-string material arrays
-            for (const m of mStr)  m?.dispose?.();
-            for (const m of mGlow) m?.dispose?.();
-            for (const m of mSus)  m?.dispose?.();
-            mBeatM?.dispose?.();
-            mBeatQ?.dispose?.();
-            mChord?.dispose?.();
-            // Text sprite cache
-            for (const k in txtCache) {
-                txtCache[k].map?.dispose();
-                txtCache[k].dispose();
-            }
+            gNote?.dispose?.(); gSus?.dispose?.(); gBeat?.dispose?.();
+            for (const m of mStr)     m?.dispose?.();
+            for (const m of mGlow)    m?.dispose?.();
+            for (const m of mSus)     m?.dispose?.();
+            for (const m of mProj)    m?.dispose?.();
+            for (const m of mProjGlow) m?.dispose?.();
+            mBeatM?.dispose?.(); mBeatQ?.dispose?.();
+            for (const k in txtCache) { txtCache[k].map?.dispose(); txtCache[k].dispose(); }
             txtCache = {};
-            // Now safe to tear down the renderer — scene resources
-            // have already had their dispose events fire.
-            if (ren) {
-                ren.dispose();
-                ren = null;
-            }
+            if (ren) { ren.dispose(); ren = null; }
             scene = cam = noteG = beatG = lblG = fretG = null;
             ambLight = dirLight = null;
-            mStr = []; mGlow = []; mSus = [];
+            mStr = []; mGlow = []; mSus = []; mProj = []; mProjGlow = []; mWhiteOutline = mSusOutline = null; stringLines = [];
+            lyricsCanvas = lyricsCtx = null;
+            projMeshArr = projGlowArr = null;
+            _probe = null;
+            _laneTargetColor = null;
+            _renderScale = 1;
             mBeatM = mBeatQ = null;
-            pNote = pSus = pLbl = pBeat = pSec = pChBar = pChStem = null;
-            mChord = null;
+            pNote = pSus = pSusOutline = pLbl = pBeat = pSec = null;
+            pFretLbl = pLane = pLaneDivider = pChordBox = pChordLbl = pBarreLine = pNoteFretLabel = pConnectorLine = pDropLine = null;
             gNote = gSus = gBeat = null;
-            tgtX = curX = 0;
-            tgtDist = curDist = CAM_DIST_BASE;
+            tgtX = curX = 0; tgtDist = curDist = CAM_DIST_BASE; tgtLookY = curLookY = 0; nStr = NSTR;
         }
 
-        /* ── Read dims from the passed canvas's actual layout ────── */
         function canvasSize(canvas) {
-            // Prefer the canvas's bounding rect so splitscreen panels
-            // (or any non-full-window container) get correct
-            // dimensions. Core's api.resize has already sized the
-            // canvas element before the first init completes.
             if (canvas) {
+                // If the canvas has zero bounds (hidden via any mechanism — inline style,
+                // CSS class, or hidden ancestor) fall back to the parent container
+                // (the splitscreen panelDiv) which is always visible and correctly sized.
                 const rect = canvas.getBoundingClientRect();
-                if (rect.width > 0 && rect.height > 0) {
-                    return { w: rect.width, h: rect.height };
-                }
+                const target = (rect.width === 0 || rect.height === 0) && canvas.parentNode ? canvas.parentNode : canvas;
+                const sz = target === canvas ? rect : target.getBoundingClientRect();
+                if (sz.width > 0 && sz.height > 0) return { w: sz.width, h: sz.height };
             }
-            // Fallback: if the canvas has no layout yet, measure the
-            // main player area. Only hit during unusual init races —
-            // matches the pre-refactor behaviour so no regression.
             const ch = document.getElementById('player-controls')?.offsetHeight || 50;
             return { w: innerWidth, h: innerHeight - ch };
         }
 
-        /* ── Lifecycle: the setRenderer contract (slopsmith#36) ───── */
+        /* ── setRenderer contract ────────────────────────────────────────── */
         return {
             init(canvas, bundle) {
-                // Reset any prior scene state from a previous init()
-                // that wasn't paired with destroy(). Core's contract
-                // says this shouldn't happen, but a double-init from a
-                // buggy caller would otherwise leave orphaned wrap
-                // elements + renderers in the DOM. Restore the prior
-                // canvas's display BEFORE we re-capture
-                // prevHighwayDisplay below — matters even when the
-                // canvas reference is the same, otherwise we'd capture
-                // "none" (the hidden state) as the "prior" and a later
-                // destroy() would "restore" the canvas to hidden
-                // permanently.
-                // Unconditional focus-unsubscribe: a prior init() that
-                // got mid-loadThree() then was superseded by THIS init()
-                // (without destroy() in between, e.g. a rapid
-                // setRenderer swap before the CDN load resolved) would
-                // otherwise leave _focusSubscribed = true on a stale
-                // closure, and the subscribe block below would attempt
-                // to register again. EventTarget de-dups same-ref
-                // listeners, but the cleaner posture is to drop the
-                // prior subscription unconditionally at init start so
-                // _focusSubscribed always reflects THIS lifetime's
-                // state. Codex P3 surfaced this on the initial commit
-                // stack — the pre-init unsubscribe was buried inside
-                // the wrap-or-ren defensive-teardown branch.
                 _unsubscribeFocus();
                 if (wrap || ren) {
-                    if (highwayCanvas) {
-                        highwayCanvas.style.display = prevHighwayDisplay;
-                    }
                     teardown();
                 }
-                _destroyed = false;
-                _isReady = false;
-                _pendingSize = null;
-                // Reset cached focus state to the default-focused
-                // value. Without this, a destroy/init cycle where the
-                // new lifetime starts with the same focus state as
-                // the previous lifetime ended would skip the
-                // intensity update via _updateFocusState's
-                // change-detect early-return — and the freshly-built
-                // scene's lights default to FULL intensity in
-                // initScene. Result: a previously-unfocused panel
-                // stays bright after re-init even though
-                // _ssIsCanvasFocused still says false.
+                _destroyed = _isReady = false;
                 _isFocused = true;
                 const myToken = ++_initToken;
-                highwayCanvas = canvas;
-                // Record the canvas's current display so destroy()
-                // can restore it, BUT don't hide the canvas yet. If
-                // Three.js fails to load or initScene aborts below,
-                // we want the 2D highway visible as a fallback
-                // instead of leaving the player blank while this
-                // broken viz is still selected. Only hide once setup
-                // has actually succeeded.
-                prevHighwayDisplay = canvas.style.display;
-                _invertedCached = !!(bundle && bundle.inverted);
+                highwayCanvas      = canvas;
+                _invertedCached    = !!(bundle && bundle.inverted);
+                _renderScale       = (bundle && bundle.renderScale) || 1;
 
-                // Subscribe to splitscreen focus events synchronously
-                // (BEFORE loadThree). A focus change during the async
-                // CDN window otherwise wouldn't deliver, and the
-                // _updateFocusState call after _isReady would never
-                // run with the right initial value. _updateFocusState
-                // is _isReady-gated internally, so events delivered
-                // pre-scene-build no-op safely; the explicit
-                // _updateFocusState() call after _isReady = true
-                // catches up.
-                //
-                // Subscribe gated on _ssActive() (full helper surface).
-                // A partial helper that ships on/offFocusChange but
-                // lacks isCanvasFocused would otherwise let us
-                // subscribe while _ssIsCanvasFocused fell back to
-                // "always focused" (main-player path), so every
-                // instance would believe itself focused.
                 if (_ssActive()) {
                     window.slopsmithSplitscreen.onFocusChange(_onFocusChange);
                     _focusSubscribed = true;
                 }
 
-                // Kick off the lazy Three.js load (memoized at module
-                // scope). Two guards in the continuation: _destroyed
-                // (set by destroy()) and the token check (a newer init
-                // on this same instance has started).
                 loadThree().then(() => {
                     if (_destroyed || _initToken !== myToken) return;
                     try {
-                        // Seed the invert-state tracker BEFORE initScene so
-                        // buildBoard's first run uses the current value;
-                        // draw's change-detection then skips the redundant
-                        // rebuild on the first frame.
+                        nStr = /bass/i.test((bundle && bundle.songInfo?.arrangement) || '') ? 4 : NSTR;
                         _invertedForBoard = _invertedCached;
-                        if (!initScene()) {
-                            // initScene already logged. Leave the 2D
-                            // canvas visible so the user has a working
-                            // highway even though this viz is in a broken
-                            // state. They can switch back to "Highway" via
-                            // the picker. Drop the focus subscription
-                            // we registered synchronously in init() —
-                            // there's no scene to dim, and leaving the
-                            // listener attached against a never-built
-                            // factory leaks the closure.
-                            _unsubscribeFocus();
-                            return;
-                        }
-                        // Scene is up — now safe to hide the 2D layer and
-                        // let the 3D overlay own the view.
-                        if (highwayCanvas) highwayCanvas.style.display = 'none';
-                        // Honour any resize that came in while we were
-                        // loading, otherwise fall back to measuring the
-                        // player layout now. A collapsed container can
-                        // produce 0/0 pending dims that applySize would
-                        // quietly reject — treat that as "no pending"
-                        // and measure the canvas layout, so we don't end
-                        // up stuck at the default backing store if no
-                        // further resize arrives.
-                        const pendingValid = _pendingSize &&
-                            _pendingSize.w > 0 && _pendingSize.h > 0;
-                        const sz = pendingValid
-                            ? _pendingSize
-                            : canvasSize(highwayCanvas);
-                        _pendingSize = null;
-                        applySize(sz.w, sz.h);
+                        if (!initScene()) { _unsubscribeFocus(); return; }
+                        const sz = canvasSize(highwayCanvas);
+                        // Mark ready before RAF so any resize(w,h) calls that arrive
+                        // in the meantime (e.g. from sizeCanvases()) are applied directly.
                         _isReady = true;
-                        // Apply the initial focus state now that the
-                        // scene exists. Any focus events that arrived
-                        // during the async loadThree() window were
-                        // safely no-op'd by _updateFocusState's
-                        // !_isReady gate; call it explicitly here so
-                        // the current splitscreen focus is reflected
-                        // on the first frame.
                         _updateFocusState();
-                    } catch (e) {
-                        // Anything thrown inside initScene / applySize /
-                        // WebGLRenderer construction lands here. Without
-                        // this we'd leave a partially-built wrap in the
-                        // DOM and potentially a hidden highway canvas.
-                        // Clean up and restore the 2D fallback so the
-                        // user isn't stuck with a blank player. Also
-                        // drop the focus subscription so a never-built
-                        // factory doesn't keep receiving events.
-                        console.error('[3D-Hwy] init .then() threw; cleaning up', e);
-                        _isReady = false;
-                        _pendingSize = null;
-                        _unsubscribeFocus();
-                        teardown();
-                        if (highwayCanvas) {
-                            highwayCanvas.style.display = prevHighwayDisplay;
+                        if (sz.w > 0 && sz.h > 0) {
+                            applySize(sz.w, sz.h);
+                        } else {
+                            // Panel container not yet laid out (sizeCanvases() runs after
+                            // initPanel() in the setup sequence). Retry each frame until
+                            // the panelDiv has real dimensions.
+                            (function retrySize() {
+                                if (_destroyed || !_isReady) return;
+                                const s = canvasSize(highwayCanvas);
+                                if (s.w > 0 && s.h > 0) applySize(s.w, s.h);
+                                else requestAnimationFrame(retrySize);
+                            })();
                         }
+                    } catch (e) {
+                        console.error('[3D-Hwy] init .then() threw:', e);
+                        _isReady = false;
+                        _unsubscribeFocus(); teardown();
                     }
                 }).catch(e => {
-                    // Bail on BOTH conditions: a newer init took over
-                    // (token mismatch) OR destroy ran while the import
-                    // was in-flight. Without the _destroyed check,
-                    // a rapid setRenderer swap followed by a late CDN
-                    // failure would log a spurious error for an
-                    // instance no longer in use. In both bail cases
-                    // the focus subscription belongs to the newer
-                    // init / destroy already cleaned up — don't touch.
                     if (_initToken !== myToken || _destroyed) return;
-                    console.error('[3D-Hwy] init aborted; Three.js unavailable', e);
-                    // CDN load failed for THIS init lifetime. Drop the
-                    // focus subscription registered synchronously in
-                    // init() — no scene was built, and a stale
-                    // listener against a never-rendered factory leaks
-                    // the closure. 2D canvas was never hidden — no
-                    // restore needed; core's next setRenderer(null) or
-                    // arrangement switch will proceed cleanly.
+                    console.error('[3D-Hwy] Three.js unavailable:', e);
                     _unsubscribeFocus();
                 });
             },
+
             draw(bundle) {
                 if (!_isReady) return;
                 _invertedCached = !!bundle.inverted;
-                // Fretboard geometry (string lines, fret wires, dots)
-                // is built once in buildBoard(); if the user toggles
-                // Invert at runtime, note placement flips via sY() but
-                // the static board would stay in the old orientation
-                // without this rebuild. buildBoard disposes its old
-                // children's geometries/materials before removing,
-                // so repeated rebuilds don't leak.
-                if (_invertedCached !== _invertedForBoard) {
+                // TODO(byrongamatos/slopsmith-plugin-3dhighway#7): derive string count
+                // dynamically rather than hard-coding 4 for bass. The ideal source is the max
+                // string index present in the note/chord data, OR a dedicated stringCount field
+                // on songInfo. song.py always emits a 6-element tuning array regardless of
+                // instrument, so tuning.length cannot be used as a signal.
+                const newNStr  = /bass/i.test(bundle.songInfo?.arrangement || '') ? 4 : NSTR;
+                const newScale = bundle.renderScale || 1;
+                if (_invertedCached !== _invertedForBoard || newNStr !== nStr) {
+                    nStr = newNStr;
                     buildBoard();
                     _invertedForBoard = _invertedCached;
+                }
+                if (newScale !== _renderScale) {
+                    _renderScale = newScale;
+                    const s = canvasSize(highwayCanvas);
+                    if (s.w > 0 && s.h > 0) applySize(s.w, s.h);
+                }
+                // Auto-resize lyricsCanvas when the highway canvas changes size.
+                // In splitscreen the hw.resize override resizes the canvas element
+                // but does not call renderer.resize(), so we detect the change here.
+                if (highwayCanvas && (highwayCanvas.width !== _lastHwW || highwayCanvas.height !== _lastHwH)) {
+                    _lastHwW = highwayCanvas.width;
+                    _lastHwH = highwayCanvas.height;
+                    const s = canvasSize(highwayCanvas);
+                    if (s.w > 0 && s.h > 0) applySize(s.w, s.h);
                 }
                 update(bundle);
                 camUpdate(bundle);
                 ren.render(scene, cam);
+                if (lyricsCtx && lyricsCanvas) {
+                    lyricsCtx.clearRect(0, 0, lyricsCanvas.width, lyricsCanvas.height);
+                    if (bundle.lyricsVisible && bundle.lyrics?.length) {
+                        drawLyrics(bundle.lyrics, bundle.currentTime, lyricsCtx, lyricsCanvas.width, lyricsCanvas.height);
+                    }
+                    if (_diagChord) {
+                        drawChordDiagram(lyricsCtx, _diagChord, _invertedCached);
+                    }
+                }
             },
+
             resize(w, h) {
-                if (!_isReady) {
-                    // Stash for application once initScene finishes —
-                    // otherwise a resize that fires while Three.js is
-                    // still loading would be dropped and first render
-                    // would use stale dims.
-                    _pendingSize = { w, h };
-                    return;
-                }
-                applySize(w, h);
+                if (!_isReady) return;
+                const s = canvasSize(highwayCanvas);
+                applySize(s.w > 0 ? s.w : w, s.h > 0 ? s.h : h);
             },
+
             destroy() {
-                // Set BEFORE attempting the (best-effort) unsubscribe
-                // so any focus-change handler that sneaks through a
-                // failed / missing offFocusChange call short-circuits
-                // on the _destroyed guard inside _updateFocusState.
-                _destroyed = true;
-                _isReady = false;
-                _pendingSize = null;
-                _unsubscribeFocus();
-                teardown();
-                if (highwayCanvas) {
-                    highwayCanvas.style.display = prevHighwayDisplay;
-                    highwayCanvas = null;
-                }
+                _destroyed = true; _isReady = false; _diagChord = null;
+                _lastHwW = 0; _lastHwH = 0;
+                _unsubscribeFocus(); teardown();
+                highwayCanvas = null;
             },
         };
     }
