@@ -24,6 +24,8 @@
         0xff9d00, // String 4 — vivid orange
         0x10e62c, // String 5 — bright lime
         0xbc00ff, // String 6 — intense violet
+        0xff6bd5, // String 7 — hot pink (extended-range guitar)
+        0x6bffe6, // String 8 — aqua (extended-range guitar)
     ];
 
     const SCALE = 2.25;
@@ -31,6 +33,26 @@
 
     const NFRETS = 24;
     const NSTR   = 6;
+    // Per-string materials and projection meshes are built via S_COL.map(),
+    // so the renderer can only address strings 0..S_COL.length-1. Using a
+    // higher count would index undefined into mGlow/mStr/mSus/projMeshArr.
+    // Extend S_COL above to support more strings.
+    const MAX_RENDER_STRINGS = S_COL.length;
+
+    // Resolve the string count for the active arrangement. Prefer
+    // bundle.stringCount (exposed by slopsmith core since #93 — derived
+    // from notes/chords/tuning, so it works for 5-string bass, 7- and
+    // 8-string guitar, etc.). Fall back to arrangement-name detection
+    // for older slopsmith cores that don't emit the field. Clamp to the
+    // palette size so a malformed bundle or a 12-string chart doesn't
+    // index past the per-string material arrays.
+    function resolveStringCount(bundle) {
+        const sc = bundle && bundle.stringCount;
+        if (Number.isFinite(sc) && sc >= 1) {
+            return Math.min(Math.trunc(sc), MAX_RENDER_STRINGS);
+        }
+        return /bass/i.test(bundle?.songInfo?.arrangement || '') ? 4 : NSTR;
+    }
 
     const STR_THICK = 0.25 * K;
 
@@ -177,8 +199,44 @@
         // Per-fret last-active timestamp for lane persistence
         let fretLastActiveTime = new Array(NFRETS + 1).fill(0);
 
-        // Active string count — 4 for bass, 6 for everything else
+        // Active string count for the current arrangement (resolved each
+        // frame from bundle.stringCount and clamped to MAX_RENDER_STRINGS).
         let nStr = NSTR;
+        // Set true once a chart with out-of-range s indices has triggered
+        // its warning. Reset only on teardown or when nStr changes (e.g.
+        // arrangement switch from guitar to bass) — same-nStr songs share
+        // the suppression, which is fine for what is purely a developer
+        // aid log.
+        let _oobStringWarned = false;
+
+        // Per-string bounds check used by every loop that indexes a
+        // per-string array (noteState.*, nextNoteByString, lastFretForString,
+        // mStr/mGlow/mSus, ...). Skipping out-of-range s upstream keeps
+        // sparse-array extension out of those arrays AND keeps drawNote's
+        // material lookup safe in one place.
+        function validString(s) {
+            const ok = Number.isInteger(s) && s >= 0 && s < nStr;
+            if (!ok && !_oobStringWarned) {
+                _oobStringWarned = true;
+                let msg = '[3D-Hwy] dropping notes with s out of range [0,' + nStr + ')';
+                if (nStr === S_COL.length) msg += ' (extended-range chart beyond palette size)';
+                console.warn(msg);
+            }
+            return ok;
+        }
+
+        // filter() allocates a new array per chord per frame, even though
+        // the vast majority of charts have no out-of-range strings. Scan
+        // first; only allocate when there's actually something to drop.
+        // The unfiltered array is reused as-is in the common case.
+        function filterValidNotes(notes) {
+            for (let i = 0; i < notes.length; i++) {
+                if (!validString(notes[i].s)) {
+                    return notes.filter(cn => validString(cn.s));
+                }
+            }
+            return notes;
+        }
 
         // Camera state
         let tgtX = 0, curX = 0;
@@ -718,6 +776,7 @@
             // Compute sustain / anticipation / fret heat / per-string glow
             if (notes) {
                 for (const n of notes) {
+                    if (!validString(n.s)) continue;
                     const dt     = n.t - now;
                     const susEnd = n.t + (n.sus || 0);
                     if (dt > 0 && dt < 0.6)
@@ -738,11 +797,13 @@
             if (chords) {
                 for (const ch of chords) {
                     if (!ch.notes) continue;
+                    const chordNotes = filterValidNotes(ch.notes);
+                    if (chordNotes.length === 0) continue;
                     let maxSus = 0;
-                    for (const n of ch.notes) if ((n.sus || 0) > maxSus) maxSus = n.sus;
+                    for (const n of chordNotes) if ((n.sus || 0) > maxSus) maxSus = n.sus;
                     const susEnd = ch.t + maxSus;
                     const dt     = ch.t - now;
-                    for (const cn of ch.notes) {
+                    for (const cn of chordNotes) {
                         if (dt > 0 && dt < 0.6)
                             noteState.stringAnticipation[cn.s] = Math.max(noteState.stringAnticipation[cn.s], 1 - dt / 0.6);
                         if (cn.f > 0) {
@@ -751,13 +812,14 @@
                         }
                     }
                     if (now >= ch.t && now <= susEnd)
-                        for (const cn of ch.notes) noteState.stringSustain[cn.s] = true;
+                        for (const cn of chordNotes) noteState.stringSustain[cn.s] = true;
                     const sustained = dt < 0 && maxSus > 0 && now <= susEnd;
                     const hitDist = Math.abs(dt);
                     if (hitDist < 0.15 || sustained) {
                         const hitFade = sustained ? 0.7 : (1 - hitDist / 0.15);
-                        for (const cn of ch.notes)
+                        for (const cn of chordNotes) {
                             noteState.strGlow[cn.s] = Math.max(noteState.strGlow[cn.s], 1.0 + hitFade * 1.5);
+                        }
                     }
                 }
             }
@@ -770,6 +832,7 @@
             if (notes) {
                 for (const n of notes) {
                     if (n.t <= now) continue;
+                    if (!validString(n.s)) continue;
                     if (!nextNoteByString[n.s] || n.t < nextNoteByString[n.s].t) nextNoteByString[n.s] = n;
                     if (n.f > 0 && n.t > now - 0.1 && n.t < now + 2) fretLastActiveTime[n.f] = now;
                 }
@@ -778,6 +841,7 @@
                 for (const ch of chords) {
                     if (!ch.notes || ch.t <= now) continue;
                     for (const cn of ch.notes) {
+                        if (!validString(cn.s)) continue;
                         if (!nextNoteByString[cn.s] || ch.t < nextNoteByString[cn.s].t)
                             nextNoteByString[cn.s] = { ...cn, t: ch.t };
                         if (cn.f > 0 && ch.t > now - 0.1 && ch.t < now + 2) fretLastActiveTime[cn.f] = now;
@@ -805,6 +869,7 @@
                         if (dt < AHEAD) highwayIntensity = Math.max(highwayIntensity, 1 - dt / AHEAD);
                     }
                     if (n.t + (n.sus || 0) < t0 || n.t > t1) continue;
+                    if (!validString(n.s)) continue;
                     const isNext      = nextNoteByString[n.s] && Math.abs(nextNoteByString[n.s].t - n.t) < 0.001;
                     const skipLabel   = lastFretForString[n.s] === n.f;
                     drawNote(n, now, undefined, isNext, skipLabel, false);
@@ -820,19 +885,29 @@
 
                 for (const ch of chords) {
                     if (!ch.notes) continue;
+                    // Filter chord notes to in-range strings once. All
+                    // chord-level aggregations (maxSus, repeat-chord
+                    // signature, open-string centroid, frame-box bounds,
+                    // active-fret highlights, fMin/fMax) read from
+                    // chordNotes so a clamped 9th-string note can't, for
+                    // instance, extend the chord's linger beyond its
+                    // visible sustain.
+                    const chordNotes = filterValidNotes(ch.notes);
+                    if (chordNotes.length === 0) continue;
+
                     if (ch.t > now) {
                         const dt = ch.t - now;
                         if (dt < AHEAD) highwayIntensity = Math.max(highwayIntensity, 1 - dt / AHEAD);
                     }
                     if (ch.t > now && ch.t < now + 2)
-                        for (const cn of ch.notes) { if (cn.f > 0) activeFrets.add(cn.f); }
+                        for (const cn of chordNotes) { if (cn.f > 0) activeFrets.add(cn.f); }
 
                     let maxSus = 0;
-                    for (const n of ch.notes) if ((n.sus || 0) > maxSus) maxSus = n.sus;
+                    for (const n of chordNotes) if ((n.sus || 0) > maxSus) maxSus = n.sus;
                     if (ch.t + maxSus < t0 || ch.t > t1) continue;
 
                     // Repeat-chord detection (consecutive same shape)
-                    const currentSig = ch.notes.slice().sort((a, b) => a.s - b.s).map(n => `${n.s}:${n.f}`).join('|');
+                    const currentSig = chordNotes.slice().sort((a, b) => a.s - b.s).map(n => `${n.s}:${n.f}`).join('|');
                     const isRepeat   = prevChordSig === currentSig && Math.abs(ch.t - prevChordTime) < 0.5;
                     prevChordSig  = currentSig;
                     prevChordTime = ch.t;
@@ -840,12 +915,12 @@
                     // Open-string center X
                     let chordCX = curX;
                     let cxL = Infinity, cxR = -Infinity, fretted = 0;
-                    for (const cn of ch.notes) {
+                    for (const cn of chordNotes) {
                         if (cn.f > 0) { const fx = fretMid(cn.f); if (fx < cxL) cxL = fx; if (fx > cxR) cxR = fx; fretted++; }
                     }
                     if (fretted > 0) chordCX = (cxL + cxR) / 2;
 
-                    for (const cn of ch.notes) {
+                    for (const cn of chordNotes) {
                         const isNext    = nextNoteByString[cn.s] && Math.abs(nextNoteByString[cn.s].t - ch.t) < 0.001;
                         const skipLabel = lastFretForString[cn.s] === cn.f;
                         drawNote({ ...cn, t: ch.t, sus: cn.sus || 0 }, now, cn.f === 0 ? chordCX : undefined, isNext, skipLabel, isRepeat, 0.55);
@@ -855,10 +930,10 @@
 
                     // Chord frame-box
                     const chDt = ch.t - now;
-                    if (ch.notes.length > 1 && chDt > -0.55 && chDt < AHEAD) {
+                    if (chordNotes.length > 1 && chDt > -0.55 && chDt < AHEAD) {
                         const z = Math.min(0, dZ(chDt));
                         let fMinCh = 99, fMaxCh = 0;
-                        for (const cn of ch.notes) { if (cn.f > 0) { fMinCh = Math.min(fMinCh, cn.f); fMaxCh = Math.max(fMaxCh, cn.f); } }
+                        for (const cn of chordNotes) { if (cn.f > 0) { fMinCh = Math.min(fMinCh, cn.f); fMaxCh = Math.max(fMaxCh, cn.f); } }
                         if (fMinCh < 99) {
                             const xLeft  = fretX(fMinCh - 1);
                             const xRight = fretX(Math.max(fMaxCh, fMinCh + 2));
@@ -898,7 +973,7 @@
 
                                 if (/barre/i.test(chordName) && chDt <= 0) {
                                     let bFret = Infinity;
-                                    for (const cn of ch.notes) if (cn.f > 0) bFret = Math.min(bFret, cn.f);
+                                    for (const cn of chordNotes) if (cn.f > 0) bFret = Math.min(bFret, cn.f);
                                     if (bFret < Infinity) {
                                         const bx    = fretMid(bFret);
                                         const yTop  = Math.max(sY(0), sY(nStr - 1));
@@ -1023,6 +1098,10 @@
         // skipBody:  don't draw the 3D note mesh (repeat chord — still shows projection)
         function drawNote(n, now, openX, isNext, skipLabel, skipBody, linger = 0.05) {
             const s      = n.s;
+            // Belt + suspenders: callers already gate via validString(),
+            // but drawNote is also entered through { ...cn } chord-note
+            // spreads, so re-check here before indexing material arrays.
+            if (!validString(s)) return;
             const dt     = n.t - now;
             const y      = sY(s);
             const susEnd = n.t + (n.sus || 0);
@@ -1273,7 +1352,7 @@
             pNote = pSus = pSusOutline = pLbl = pBeat = pSec = null;
             pFretLbl = pLane = pLaneDivider = pChordBox = pChordLbl = pBarreLine = pNoteFretLabel = pConnectorLine = pDropLine = null;
             gNote = gSus = gBeat = null;
-            tgtX = curX = 0; tgtDist = curDist = CAM_DIST_BASE; tgtLookY = curLookY = 0; nStr = NSTR;
+            tgtX = curX = 0; tgtDist = curDist = CAM_DIST_BASE; tgtLookY = curLookY = 0; nStr = NSTR; _oobStringWarned = false;
         }
 
         function canvasSize(canvas) {
@@ -1312,7 +1391,7 @@
                 loadThree().then(() => {
                     if (_destroyed || _initToken !== myToken) return;
                     try {
-                        nStr = /bass/i.test((bundle && bundle.songInfo?.arrangement) || '') ? 4 : NSTR;
+                        nStr = resolveStringCount(bundle);
                         _invertedForBoard = _invertedCached;
                         if (!initScene()) { _unsubscribeFocus(); return; }
                         const sz = canvasSize(highwayCanvas);
@@ -1348,14 +1427,10 @@
             draw(bundle) {
                 if (!_isReady) return;
                 _invertedCached = !!bundle.inverted;
-                // TODO(byrongamatos/slopsmith-plugin-3dhighway#7): derive string count
-                // dynamically rather than hard-coding 4 for bass. The ideal source is the max
-                // string index present in the note/chord data, OR a dedicated stringCount field
-                // on songInfo. song.py always emits a 6-element tuning array regardless of
-                // instrument, so tuning.length cannot be used as a signal.
-                const newNStr  = /bass/i.test(bundle.songInfo?.arrangement || '') ? 4 : NSTR;
+                const newNStr  = resolveStringCount(bundle);
                 const newScale = bundle.renderScale || 1;
                 if (_invertedCached !== _invertedForBoard || newNStr !== nStr) {
+                    if (newNStr !== nStr) _oobStringWarned = false;
                     nStr = newNStr;
                     buildBoard();
                     _invertedForBoard = _invertedCached;
