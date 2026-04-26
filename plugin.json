@@ -1,7 +1,8 @@
 {
     "id": "highway_3d",
     "name": "3D Highway",
-    "version": "3.1.0",
+    "version": "3.2.0",
     "type": "visualization",
-    "script": "screen.js"
+    "script": "screen.js",
+    "settings": { "html": "settings.html" }
 }

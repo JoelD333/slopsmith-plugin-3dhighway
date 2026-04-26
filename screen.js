@@ -157,6 +157,428 @@
     }
 
     /* ======================================================================
+     *  Background animations (issue #13)
+     *
+     *  Audio-reactive ambient scenery in the fog band beyond the highway.
+     *  Module-level singletons share an AudioContext + AnalyserNode tap on
+     *  the slopsmith core <audio id="audio"> element across all panel
+     *  instances; per-panel settings live in localStorage with a global
+     *  fallback so settings.html drives a single default while per-panel
+     *  overrides (h3d_bg_panel<idx>_*) can be set for splitscreen layouts.
+     *
+     *  Caveat: createMediaElementSource() can only be called once per
+     *  element. 3dhighway owns that source for now; future plugins
+     *  needing an analyser will have to share through a core API.
+     * ====================================================================== */
+
+    // Returned from _bgReadBands when reactive=false or analyser
+    // unavailable; shared so the per-frame non-reactive path doesn't
+    // allocate. Declared up-front because _bgBandsCache initializes to
+    // it during the same IIFE execution pass.
+    const BG_ZERO_BANDS = Object.freeze({ bass: 0, mid: 0, treble: 0 });
+
+    // Module-level AudioContext singleton. Intentionally never torn
+    // down: createMediaElementSource(<audio>) is irrevocable — once
+    // called, the element's audio is permanently routed through this
+    // context for the page's lifetime. Closing the context would
+    // silence playback. The leak (one AudioContext + one AnalyserNode,
+    // a few KB) is the cost of having a plugin tap audio at all.
+    let _bgAudio = null;
+    let _bgAudioFailedAt = 0;  // performance.now() of last failure, 0 = never
+    const _BG_AUDIO_RETRY_MS = 1000;
+    function _bgGetAnalyser() {
+        if (_bgAudio && !_bgAudio.failed) return _bgAudio;
+        if (_bgAudio && _bgAudio.failed) {
+            // Distinguish permanent failures from transient ones.
+            // InvalidStateError on createMediaElementSource means the
+            // <audio> element is already tapped by another consumer —
+            // there's no recovering from that without a page reload, so
+            // don't retry. Transient failures (NotAllowedError before
+            // first user gesture, etc.) get a once-per-second retry so
+            // reactivity recovers once the blocking condition clears.
+            if (_bgAudio.permanent) return null;
+            if (performance.now() - _bgAudioFailedAt < _BG_AUDIO_RETRY_MS) return null;
+        }
+        const audio = document.getElementById('audio');
+        if (!audio) return null;
+        // Hoist ctx out of the try so we can close() it if a later step
+        // throws (e.g. createMediaElementSource on an element that
+        // already has a source node). Otherwise the AudioContext leaks.
+        let ctx = null;
+        try {
+            const Ctx = window.AudioContext || window.webkitAudioContext;
+            if (!Ctx) throw new Error('Web Audio API not available');
+            ctx = new Ctx();
+            const source = ctx.createMediaElementSource(audio);
+            const analyser = ctx.createAnalyser();
+            analyser.fftSize = 256;
+            source.connect(analyser);
+            analyser.connect(ctx.destination);
+            _bgAudio = { ctx, analyser, freq: new Uint8Array(analyser.frequencyBinCount) };
+            // Browsers with autoplay restrictions hand back a suspended
+            // AudioContext; createMediaElementSource then routes the
+            // <audio> through that suspended graph and playback goes
+            // silent (and the analyser reads zeros) until we resume.
+            // Try once now (fine if the page already had a user gesture)
+            // and again on every play event so the first successful
+            // user-initiated play unblocks the graph.
+            const resume = () => {
+                if (ctx.state === 'suspended' && typeof ctx.resume === 'function') {
+                    ctx.resume().catch(() => { /* no gesture yet, retry on next play */ });
+                }
+            };
+            resume();
+            audio.addEventListener('play', resume);
+            return _bgAudio;
+        } catch (e) {
+            if (ctx && typeof ctx.close === 'function') {
+                try { ctx.close(); } catch (_) { /* close errors during failure path are noise */ }
+            }
+            console.warn('[3D-Hwy] failed to set up audio analyser:', e);
+            const permanent = !!(e && e.name === 'InvalidStateError');
+            _bgAudio = { failed: true, permanent };
+            _bgAudioFailedAt = performance.now();
+            return null;
+        }
+    }
+
+    // Bands cache: in splitscreen, every panel asks for bands per frame.
+    // The analyser is shared, so the answer is identical — cache for a
+    // few ms so 4-up splitscreen pays one getByteFrequencyData + one sum
+    // pass per frame instead of four.
+    const _BG_BANDS_CACHE_MS = 5;
+    let _bgBandsLastT = -Infinity;
+    // Mutable cache reused across reads — refreshing in place keeps the
+    // per-frame allocation count at zero. Style.update() uses the bands
+    // synchronously within the same frame so the live-mutation contract
+    // is safe.
+    const _bgBandsCache = { bass: 0, mid: 0, treble: 0 };
+    function _bgReadBands() {
+        const a = _bgGetAnalyser();
+        if (!a) return BG_ZERO_BANDS;
+        const t = performance.now();
+        if (t - _bgBandsLastT < _BG_BANDS_CACHE_MS) return _bgBandsCache;
+        _bgBandsLastT = t;
+        a.analyser.getByteFrequencyData(a.freq);
+        let bass = 0, mid = 0, treble = 0;
+        for (let i = 0; i < 8;   i++) bass   += a.freq[i];
+        for (let i = 8; i < 40;  i++) mid    += a.freq[i];
+        for (let i = 40; i < 128; i++) treble += a.freq[i];
+        _bgBandsCache.bass   = bass   / (8 * 255);
+        _bgBandsCache.mid    = mid    / (32 * 255);
+        _bgBandsCache.treble = treble / (88 * 255);
+        return _bgBandsCache;
+    }
+
+    const BG_DEFAULTS = { style: 'particles', intensity: 0.5, reactive: true };
+    const BG_STYLE_IDS = ['off', 'particles', 'silhouettes', 'lights', 'geometric'];
+
+    function _bgPanelKey(canvas) {
+        const ss = window.slopsmithSplitscreen;
+        const idx = (ss && typeof ss.panelIndexFor === 'function') ? ss.panelIndexFor(canvas) : null;
+        return (idx == null) ? 'main' : 'panel' + idx;
+    }
+    // In-memory fallback for when localStorage is blocked (private mode,
+    // sandboxed iframes, some test runners). _bgWriteGlobal stages the
+    // value here too, and _bgReadSetting falls through to it before
+    // BG_DEFAULTS. Without this, a write that silently failed to
+    // persist would still emit a change event — and the listener would
+    // read back the default, immediately blowing away what the user
+    // just picked in settings.html.
+    const _bgMemFallback = Object.create(null);
+    function _bgReadSetting(panelKey, key) {
+        try {
+            const panelVal = localStorage.getItem('h3d_bg_' + panelKey + '_' + key);
+            if (panelVal !== null && panelVal !== undefined) return _bgCoerce(key, panelVal);
+            const globalVal = localStorage.getItem('h3d_bg_' + key);
+            if (globalVal !== null && globalVal !== undefined) return _bgCoerce(key, globalVal);
+        } catch (_) { /* storage blocked — fall through to in-memory */ }
+        if (key in _bgMemFallback) return _bgCoerce(key, _bgMemFallback[key]);
+        return BG_DEFAULTS[key];
+    }
+    function _bgCoerce(key, val) {
+        if (key === 'intensity') {
+            const n = parseFloat(val);
+            return Number.isFinite(n) ? Math.max(0, Math.min(1, n)) : BG_DEFAULTS.intensity;
+        }
+        if (key === 'reactive') {
+            if (val === 'true'  || val === '1') return true;
+            if (val === 'false' || val === '0') return false;
+            return BG_DEFAULTS.reactive;  // unknown / corrupted → default, matches settings.html coerceReactive
+        }
+        if (key === 'style') return BG_STYLE_IDS.includes(val) ? val : BG_DEFAULTS.style;
+        return val;
+    }
+    function _bgWriteGlobal(key, val) {
+        const s = String(val);
+        try { localStorage.setItem('h3d_bg_' + key, s); } catch (_) { /* storage blocked */ }
+        // Stage in memory regardless of storage success, so a blocked-
+        // storage browser still applies the change and persists it for
+        // the rest of the session.
+        _bgMemFallback[key] = s;
+        _bgEmitChange(key);
+    }
+
+    // Pub-sub so settings.html can update live across all panel instances.
+    const _bgListeners = new Set();
+    function _bgSubscribe(fn) { _bgListeners.add(fn); }
+    function _bgUnsubscribe(fn) { _bgListeners.delete(fn); }
+    function _bgEmitChange(key) {
+        for (const fn of _bgListeners) {
+            try { fn(key); } catch (e) { console.error('[3D-Hwy] bg listener threw', e); }
+        }
+    }
+
+    // Settings.html setters — global keys; per-panel overrides via direct
+    // localStorage edits today, runtime UI in a follow-up.
+    window.h3dBgSetStyle     = (v) => _bgWriteGlobal('style', v);
+    window.h3dBgSetIntensity = (v) => _bgWriteGlobal('intensity', v);
+    window.h3dBgSetReactive  = (v) => _bgWriteGlobal('reactive', !!v);
+
+    // Procedural silhouette bitmap, drawn once and shared across panels.
+    // The Canvas2D bitmap is module-level (cheap, CPU-only); each layer
+    // wraps it in its own CanvasTexture so per-layer texture.offset.x
+    // can drive a seam-free scroll without coupling to other layers /
+    // panels (a shared CanvasTexture would synchronize all offsets).
+    let _silCanvas = null;
+    function _bgEnsureSilhouetteCanvas() {
+        if (_silCanvas) return _silCanvas;
+        const c = document.createElement('canvas');
+        c.width = 1024; c.height = 64;
+        const cx = c.getContext('2d');
+        if (!cx) {
+            // Restrictive environments (some sandboxed iframes, headless
+            // tests) can return null. Without a guard, the clearRect/
+            // fillRect calls below would throw TypeError and the silhouette
+            // style would never become available.
+            throw new Error('[3D-Hwy] 2D canvas context unavailable for silhouette texture');
+        }
+        cx.clearRect(0, 0, c.width, c.height);
+        cx.fillStyle = '#000814';
+        let x = 0;
+        while (x < c.width) {
+            const w = 8 + Math.random() * 30;
+            const h = 20 + Math.random() * 40;
+            cx.fillRect(x, c.height - h, w, h);
+            x += w + Math.random() * 10;
+        }
+        _silCanvas = c;
+        return c;
+    }
+
+    // Background-style registry. Each entry returns a per-panel state
+    // object from build() and reads from it in update() / teardown().
+    // T (THREE) is set by the time these are invoked (initScene runs
+    // inside loadThree().then).
+    const BG_STYLES = {
+        off: {
+            build() { return null; },
+            update() {},
+            teardown() {},
+        },
+        particles: {
+            build(scene, settings) {
+                const N = Math.max(20, Math.floor(80 + 200 * settings.intensity));
+                const positions = new Float32Array(N * 3);
+                for (let i = 0; i < N; i++) {
+                    positions[i * 3]     = (Math.random() - 0.5) * 800 * K;
+                    positions[i * 3 + 1] = (Math.random() - 0.4) * 80 * K;
+                    // Past note travel range. Notes go to ~ -AHEAD * TS =
+                    // -600 * K; spawning at -FOG_END * 0.95 ≈ -636 * K
+                    // and farther guarantees particles never paint over a
+                    // note even before the renderOrder belt-and-suspenders.
+                    positions[i * 3 + 2] = -FOG_END * (0.95 + Math.random() * 0.25);
+                }
+                const geo = new T.BufferGeometry();
+                geo.setAttribute('position', new T.BufferAttribute(positions, 3));
+                const mat = new T.PointsMaterial({
+                    color: 0xa0c0ff, size: 1.5 * K, transparent: true, opacity: 0.5,
+                    blending: T.AdditiveBlending, depthWrite: false, sizeAttenuation: true,
+                });
+                const points = new T.Points(geo, mat);
+                scene.add(points);
+                return { points, geo, mat, N };
+            },
+            update(s, bands, dt) {
+                const positions = s.geo.attributes.position.array;
+                const dx = dt * (3 + bands.mid * 12) * K;
+                for (let i = 0; i < s.N; i++) {
+                    positions[i * 3] += dx;
+                    if (positions[i * 3] > 400 * K) positions[i * 3] -= 800 * K;
+                }
+                s.geo.attributes.position.needsUpdate = true;
+                s.mat.opacity = 0.4 + bands.treble * 0.4;
+            },
+            teardown(s) {
+                if (!s) return;
+                s.points.parent?.remove(s.points);
+                s.geo.dispose();
+                s.mat.dispose();
+            },
+        },
+        silhouettes: {
+            build(scene, settings) {
+                const canvas = _bgEnsureSilhouetteCanvas();
+                // Notes travel out to ~ -AHEAD * TS = -600*K. Place all
+                // silhouette layers beyond that and well into the fog
+                // so they read as distant scenery, not as something in
+                // the play space.
+                const depths = [-FOG_END * 0.95, -FOG_END * 1.05, -FOG_END * 1.15];
+                const layers = [];
+                const allocated = [];
+                try {
+                    for (const z of depths) {
+                        // Per-layer CanvasTexture wrapping the shared
+                        // canvas: lets each layer scroll independently
+                        // via texture.offset.x without coupling to its
+                        // siblings or to other panels.
+                        const tex = new T.CanvasTexture(canvas);
+                        tex.wrapS = T.RepeatWrapping;
+                        const geo = new T.PlaneGeometry(800 * K, 50 * K);
+                        const mat = new T.MeshBasicMaterial({
+                            map: tex, transparent: true, opacity: 0.4, depthWrite: false,
+                        });
+                        const mesh = new T.Mesh(geo, mat);
+                        mesh.position.set(0, -10 * K, z);
+                        scene.add(mesh);
+                        // Parallax: nearer layers move more than farther
+                        // ones (perspective). distance = -z; small d ->
+                        // large parallax. Scaled so the nearest sits
+                        // around 0.32 and farthest around 0.18.
+                        const distance = -z;
+                        const parallax = Math.max(0.05, 1 - distance / (FOG_END * 1.4));
+                        const layer = { mesh, geo, mat, tex, z, drift: 0, parallax };
+                        layers.push(layer);
+                        allocated.push(layer);
+                    }
+                    return { layers, intensity: settings.intensity };
+                } catch (e) {
+                    // Build threw partway — clean up any per-layer
+                    // textures we already created. _bgMountStyle's catch
+                    // disposes the stage tree's meshes, but a partial-
+                    // build's CanvasTextures aren't reachable from any
+                    // mesh yet, so this catch owns them.
+                    for (const L of allocated) {
+                        L.tex?.dispose?.();
+                    }
+                    throw e;
+                }
+            },
+            update(s, bands, dt) {
+                // Intensity multiplier: 0 dims to ~50% of base, 1
+                // brightens to ~120%. Below-base values still leave the
+                // silhouettes faintly visible so users know the style
+                // is on; above-base lets the layers read as a real
+                // backdrop on louder passages.
+                const intensityMul = 0.5 + s.intensity * 0.7;
+                for (const L of s.layers) {
+                    // Scroll via texture.offset.x with RepeatWrapping —
+                    // unbounded, no modulus snap. The mesh stays put;
+                    // the texture wraps continuously across the visible
+                    // surface. (offset is in normalized texture space,
+                    // so we keep it small and let the wrap do the job.)
+                    L.drift += dt * (0.05 + bands.mid * 0.15) * L.parallax;
+                    L.mat.map.offset.x = L.drift;
+                    L.mesh.position.y = -10 * K + bands.bass * 4 * K;
+                    L.mat.opacity = (0.25 + 0.5 * L.parallax) * intensityMul;
+                }
+            },
+            teardown(s) {
+                if (!s) return;
+                for (const L of s.layers) {
+                    L.mesh.parent?.remove(L.mesh);
+                    L.geo.dispose();
+                    L.mat.dispose();
+                    L.tex.dispose();
+                }
+            },
+        },
+        lights: {
+            build(scene, settings) {
+                // Lights count scales 6 → 14 over intensity 0 → 1.
+                // _bgCoerce clamps intensity to [0,1] before it reaches
+                // here, so no further clamp is needed.
+                const N = Math.floor(6 + 8 * settings.intensity);
+                const lights = [];
+                for (let i = 0; i < N; i++) {
+                    const color = S_COL[i % S_COL.length];
+                    const geo = new T.PlaneGeometry(15 * K, 15 * K);
+                    const mat = new T.MeshBasicMaterial({
+                        color, transparent: true, opacity: 0.4,
+                        blending: T.AdditiveBlending, depthWrite: false,
+                    });
+                    const mesh = new T.Mesh(geo, mat);
+                    mesh.position.set(
+                        (Math.random() - 0.5) * 600 * K,
+                        (Math.random() - 0.3) * 80 * K,
+                        // Past note travel range — same rationale as
+                        // particles above.
+                        -FOG_END * (0.95 + Math.random() * 0.25)
+                    );
+                    scene.add(mesh);
+                    lights.push({ mesh, geo, mat, baseScale: 1 + Math.random() * 0.5, phase: Math.random() * Math.PI * 2 });
+                }
+                return { lights };
+            },
+            update(s, bands, dt, t) {
+                for (const L of s.lights) {
+                    const pulse = 1 + bands.bass * 1.5 + Math.sin(t * 1.5 + L.phase) * 0.2;
+                    L.mesh.scale.set(L.baseScale * pulse, L.baseScale * pulse, 1);
+                    L.mat.opacity = 0.35 + bands.treble * 0.3;
+                }
+            },
+            teardown(s) {
+                if (!s) return;
+                for (const L of s.lights) {
+                    L.mesh.parent?.remove(L.mesh);
+                    L.geo.dispose();
+                    L.mat.dispose();
+                }
+            },
+        },
+        geometric: {
+            build(scene, settings) {
+                const meshes = [];
+                const op = 0.25 + 0.2 * settings.intensity;
+                const ico = new T.Mesh(
+                    new T.IcosahedronGeometry(20 * K, 1),
+                    new T.MeshBasicMaterial({ color: 0x6080c0, wireframe: true, transparent: true, opacity: op, depthWrite: false }),
+                );
+                // Past note travel range (~ -AHEAD * TS = -600*K) so the
+                // wireframes never paint over a far note.
+                ico.position.set(-100 * K, 30 * K, -FOG_END * 1.0);
+                scene.add(ico);
+                meshes.push(ico);
+                const torus = new T.Mesh(
+                    new T.TorusGeometry(15 * K, 3 * K, 6, 12),
+                    new T.MeshBasicMaterial({ color: 0xc06080, wireframe: true, transparent: true, opacity: op * 0.9, depthWrite: false }),
+                );
+                torus.position.set(120 * K, 20 * K, -FOG_END * 1.1);
+                scene.add(torus);
+                meshes.push(torus);
+                return { meshes };
+            },
+            update(s, bands, dt) {
+                const speed = 0.2 + bands.mid * 0.4;
+                const pulse = 1 + bands.bass * 0.25;
+                for (const m of s.meshes) {
+                    m.rotation.x += dt * speed * 0.3;
+                    m.rotation.y += dt * speed * 0.4;
+                    m.scale.setScalar(pulse);
+                }
+            },
+            teardown(s) {
+                if (!s) return;
+                for (const m of s.meshes) {
+                    m.parent?.remove(m);
+                    m.geometry.dispose();
+                    m.material.dispose();
+                }
+            },
+        },
+    };
+
+    /* ======================================================================
      *  Per-instance counter
      * ====================================================================== */
 
@@ -187,6 +609,14 @@
         let _lastHwW = 0, _lastHwH = 0;
         let mBeatM = null, mBeatQ = null;
         let txtCache = {};
+
+        // Background animation state (issue #13). bgGroup is the parent
+        // container for all bg meshes so teardown is one remove + dispose
+        // pass. bgState is the active style's per-panel state object.
+        let bgGroup = null, bgStage = null, bgState = null;
+        let bgStyleId = 'particles', bgIntensity = 0.5, bgReactive = true;
+        let _bgListener = null;
+        let _bgLastT = 0;  // ms timestamp for dt
 
         // Object pools
         let pNote, pSus, pLbl, pBeat, pSec;
@@ -645,7 +1075,121 @@
             ));
 
             buildBoard();
+
+            // Background animations (#13). Read settings keyed by this
+            // panel and mount the active style's meshes. Subscribe to
+            // in-app settings changes (settings.html via window.h3dBgSet*)
+            // so they propagate without a reload. Manual localStorage
+            // edits don't fire the pub-sub and require a reload.
+            _bgLoadSettings();
+            bgGroup = new T.Group();
+            // Note: renderOrder on a Group is a no-op (Three.js Groups
+            // are transforms, not rendered objects, so renderOrder only
+            // affects the actual meshes inside). _bgMountStyle stamps
+            // renderOrder = -1 on every child after build, which IS what
+            // forces background to render before gameplay geometry.
+            // Combined with the deeper-than-note-range placements below,
+            // background never paints over notes.
+            scene.add(bgGroup);
+            _bgMountStyle();
+            _bgListener = (changedKey) => {
+                if (changedKey === 'reactive') {
+                    // Reactive flag flips don't need a mesh rebuild —
+                    // just refresh bgReactive so next frame stops/starts
+                    // sampling bands.
+                    _bgLoadSettings();
+                    return;
+                }
+                if (!changedKey || changedKey === 'style' || changedKey === 'intensity') {
+                    _bgRebuild();
+                }
+            };
+            _bgSubscribe(_bgListener);
+
             return true;
+        }
+
+        function _bgLoadSettings() {
+            const panelKey = _bgPanelKey(highwayCanvas);
+            bgStyleId   = _bgReadSetting(panelKey, 'style');
+            bgIntensity = _bgReadSetting(panelKey, 'intensity');
+            bgReactive  = _bgReadSetting(panelKey, 'reactive');
+        }
+        function _bgMountStyle() {
+            const style = BG_STYLES[bgStyleId] || BG_STYLES.off;
+            // Build into a fresh stage group so a partial throw can't
+            // orphan meshes inside bgGroup. On success the stage joins
+            // bgGroup atomically; on failure the stage and everything
+            // in it are disposed and bgState stays null.
+            const stage = new T.Group();
+            let result = null;
+            try {
+                result = style.build(stage, { intensity: bgIntensity }) || null;
+            } catch (e) {
+                console.error('[3D-Hwy] bg style build failed', bgStyleId, e);
+                _bgDisposeGroupTree(stage);
+                bgState = null;
+                bgStage = null;
+                return;
+            }
+            // renderOrder on a Group doesn't propagate to its children
+            // (Three.js sorts by per-object renderOrder, and a Group is a
+            // transform, not a rendered object). Stamp every mesh in the
+            // stage so transparent bg objects always sort behind notes
+            // regardless of their z relative to gameplay geometry.
+            stage.traverse((c) => { c.renderOrder = -1; });
+            bgGroup.add(stage);
+            bgStage = stage;
+            bgState = result;
+        }
+        function _bgUnmountStyle() {
+            const style = BG_STYLES[bgStyleId] || BG_STYLES.off;
+            try { style.teardown(bgState); } catch (e) { console.error('[3D-Hwy] bg teardown', e); }
+            bgState = null;
+            // Belt + suspenders: even if a style's teardown forgets to
+            // dispose something, the stage tree dispose mops up.
+            if (bgStage) {
+                bgStage.parent?.remove(bgStage);
+                _bgDisposeGroupTree(bgStage);
+                bgStage = null;
+            }
+        }
+        // Recursively dispose geometries / materials attached to an
+        // Object3D tree, then detach. Used as a safety net during
+        // _bgMountStyle failures and on _bgUnmountStyle.
+        //
+        // Deliberately does NOT dispose material.map textures — texture
+        // lifetime belongs to whoever allocated the texture. The
+        // silhouettes style allocates a per-layer CanvasTexture wrapping
+        // the shared _silCanvas bitmap, and disposes those textures in
+        // its own teardown. Disposing them here would double-dispose,
+        // and any future plugin texture sharing across panels (e.g. an
+        // upcoming custom-background feature) would break the same way.
+        // Style teardown owns texture release.
+        function _bgDisposeGroupTree(obj) {
+            if (!obj) return;
+            obj.traverse((child) => {
+                child.geometry?.dispose?.();
+                const mat = child.material;
+                if (mat) {
+                    const mats = Array.isArray(mat) ? mat : [mat];
+                    for (const m of mats) m?.dispose?.();
+                }
+            });
+            obj.parent?.remove(obj);
+        }
+        function _bgRebuild() {
+            if (!bgGroup) return;
+            // Order matters: teardown must run against the (style id,
+            // state) pair that built the meshes, so unmount BEFORE
+            // reloading settings. Reload, then mount with the new id.
+            _bgUnmountStyle();
+            _bgLoadSettings();
+            _bgMountStyle();
+            // Reset dt accounting so the first frame after a switch
+            // doesn't see a huge "since last update" window — that
+            // would clamp to 0.1 and visibly snap motion / rotation.
+            _bgLastT = 0;
         }
 
         /* ── Fretboard (static geometry) ────────────────────────────────── */
@@ -1320,13 +1864,29 @@
 
         /* ── Teardown ────────────────────────────────────────────────────── */
         function teardown() {
+            // Background animations (#13). Drop the listener first so any
+            // mid-teardown settings change doesn't try to rebuild a torn-
+            // down scene; then dispose the active style's resources.
+            if (_bgListener) { _bgUnsubscribe(_bgListener); _bgListener = null; }
+            _bgUnmountStyle();
+            bgGroup = null; _bgLastT = 0;
+
             if (wrap) { wrap.remove(); wrap = null; }
             if (scene) {
+                // Don't dispose material.map textures here. Texture
+                // lifetime belongs to whoever allocated it; the bg
+                // styles' per-layer CanvasTextures (e.g. silhouettes'
+                // wrappers around the shared _silCanvas) are released
+                // in their own teardowns. txtCache textures are
+                // explicitly disposed below; mStr/mGlow/etc. don't have
+                // a .map. Disposing here would either double-free or
+                // yank a still-in-use texture out from under another
+                // mount.
                 scene.traverse((obj) => {
                     obj.geometry?.dispose?.();
                     if (obj.material) {
                         const mats = Array.isArray(obj.material) ? obj.material : [obj.material];
-                        for (const m of mats) { m.map?.dispose?.(); m.dispose?.(); }
+                        for (const m of mats) m?.dispose?.();
                     }
                 });
             }
@@ -1451,6 +2011,22 @@
                 }
                 update(bundle);
                 camUpdate(bundle);
+
+                // Background animations (#13). Compute frame dt once,
+                // read audio bands when reactivity is on, delegate to
+                // the active style's update().
+                if (bgGroup && bgStyleId !== 'off') {
+                    const nowMs = performance.now();
+                    const dt = _bgLastT === 0 ? 1 / 60 : Math.min(0.1, (nowMs - _bgLastT) / 1000);
+                    _bgLastT = nowMs;
+                    const bands = bgReactive ? _bgReadBands() : BG_ZERO_BANDS;
+                    const style = BG_STYLES[bgStyleId];
+                    if (style && bgState) {
+                        try { style.update(bgState, bands, dt, nowMs / 1000); }
+                        catch (e) { console.error('[3D-Hwy] bg update threw', bgStyleId, e); }
+                    }
+                }
+
                 ren.render(scene, cam);
                 if (lyricsCtx && lyricsCanvas) {
                     lyricsCtx.clearRect(0, 0, lyricsCanvas.width, lyricsCanvas.height);
