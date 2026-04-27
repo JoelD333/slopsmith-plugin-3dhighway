@@ -283,7 +283,7 @@
         return _bgBandsCache;
     }
 
-    const BG_DEFAULTS = { style: 'particles', intensity: 0.5, reactive: true, palette: 'default' };
+    const BG_DEFAULTS = { style: 'particles', intensity: 0.5, reactive: true, palette: 'default', showFretOnNote: false };
     const BG_STYLE_IDS = ['off', 'particles', 'silhouettes', 'lights', 'geometric'];
 
     function _bgPanelKey(canvas) {
@@ -309,16 +309,24 @@
         if (key in _bgMemFallback) return _bgCoerce(key, _bgMemFallback[key]);
         return BG_DEFAULTS[key];
     }
+    // Shared "stored string -> bool" coercion for every boolean
+    // setting. Mirrors settings.html's coerceBool so the renderer and
+    // the UI hydration always agree on what a corrupted/unknown value
+    // means (fall back to default rather than silently flipping to
+    // false). Add new boolean keys to BG_DEFAULTS and they pick this
+    // up via the dispatch below.
+    const _BG_BOOL_KEYS = new Set(['reactive', 'showFretOnNote']);
+    function _bgCoerceBool(val, fallback) {
+        if (val === 'true'  || val === '1') return true;
+        if (val === 'false' || val === '0') return false;
+        return fallback;
+    }
     function _bgCoerce(key, val) {
         if (key === 'intensity') {
             const n = parseFloat(val);
             return Number.isFinite(n) ? Math.max(0, Math.min(1, n)) : BG_DEFAULTS.intensity;
         }
-        if (key === 'reactive') {
-            if (val === 'true'  || val === '1') return true;
-            if (val === 'false' || val === '0') return false;
-            return BG_DEFAULTS.reactive;  // unknown / corrupted → default, matches settings.html coerceReactive
-        }
+        if (_BG_BOOL_KEYS.has(key)) return _bgCoerceBool(val, BG_DEFAULTS[key]);
         if (key === 'style') return BG_STYLE_IDS.includes(val) ? val : BG_DEFAULTS.style;
         if (key === 'palette') return PALETTE_IDS.includes(val) ? val : BG_DEFAULTS.palette;
         return val;
@@ -349,6 +357,7 @@
     window.h3dBgSetIntensity = (v) => _bgWriteGlobal('intensity', v);
     window.h3dBgSetReactive  = (v) => _bgWriteGlobal('reactive', !!v);
     window.h3dBgSetPalette   = (v) => _bgWriteGlobal('palette', v);
+    window.h3dBgSetShowFretOnNote = (v) => _bgWriteGlobal('showFretOnNote', !!v);
     // Back-compat alias for any caller that picked up the original
     // (inconsistent) name during this PR's review window.
     window.h3dSetPalette     = window.h3dBgSetPalette;
@@ -689,6 +698,10 @@
         // than the module-level S_COL, so a palette swap re-tints the
         // panel live without touching module-level state.
         let activePalette = PALETTES.default;
+        // Show fret number on each fretted note body (issue #12). Off
+        // by default — opt-in setting for players who like the at-a-
+        // glance fret cue.
+        let showFretOnNote = false;
         let _bgListener = null;
         let _bgLastT = 0;  // ms timestamp for dt
 
@@ -1190,10 +1203,11 @@
             scene.add(bgGroup);
             _bgMountStyle();
             _bgListener = (changedKey) => {
-                if (changedKey === 'reactive') {
+                if (changedKey === 'reactive' || changedKey === 'showFretOnNote') {
                     // Reactive flag flips don't need a mesh rebuild —
-                    // just refresh bgReactive so next frame stops/starts
-                    // sampling bands.
+                    // just refresh the per-instance flag for the next
+                    // frame to consult. Same shape for showFretOnNote
+                    // (#12), which is read per-frame in drawNote.
                     _bgLoadSettings();
                     return;
                 }
@@ -1277,6 +1291,7 @@
                 activePalette = newPalette;
                 _applyPaletteToMaterials();
             }
+            showFretOnNote = _bgReadSetting(panelKey, 'showFretOnNote');
         }
         // Live-swap palette by mutating existing materials in place.
         // Three.js colors propagate to all sharing meshes on the next
@@ -1934,6 +1949,25 @@
                     lb.material = txtMat(0, hit ? '#fff' : '#ddd', false);
                     lb.scale.set(NW * 0.7, NH * 0.8, 1);
                     lb.position.set(x, y + vibrato, noteZ + 0.01 * K);
+                } else if (showFretOnNote && n.f > 0) {
+                    // Embedded fret number on the note body (issue #12).
+                    // The `n.f > 0` guard is redundant in the normal
+                    // path (we're already in the else of `n.f === 0`)
+                    // but matches the rest of the renderer's "fretted
+                    // means n.f > 0" convention (e.g. approachRot,
+                    // connector label) and side-steps any bogus
+                    // negative / NaN fret values from a malformed
+                    // chart. Sprite is camera-facing so it stays
+                    // readable through the note's approach-rotation.
+                    // Core sits at noteZ + 0.001 (raw world units, not
+                    // K-scaled), so place the label at noteZ + 0.005
+                    // — definitively in front of the core regardless
+                    // of how K resolves, units consistent with the
+                    // core's offset.
+                    const lb = pLbl.get();
+                    lb.material = txtMat(n.f, hit ? '#fff' : '#eee', false);
+                    lb.scale.set(NW * 0.7, NH * 0.85, 1);
+                    lb.position.set(x, y + vibrato, noteZ + 0.005);
                 }
 
                 // ── Sustain trail ─────────────────────────────────────────

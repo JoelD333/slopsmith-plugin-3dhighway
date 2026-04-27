@@ -60,6 +60,23 @@
             React to audio
         </label>
     </div>
+</div>
+
+<div role="group" aria-labelledby="h3d-notes-heading" class="mt-6">
+    <h3 id="h3d-notes-heading" class="text-sm font-medium text-gray-400 mb-2">3D Highway — Notes</h3>
+    <p class="text-xs text-gray-500 mb-3">
+        Per-note display options.
+    </p>
+
+    <!-- Show fret number on note body (#12) -->
+    <div class="flex items-center gap-3 mt-3">
+        <label class="flex items-center gap-2 text-sm text-gray-300">
+            <input type="checkbox" id="h3d-show-fret-on-note"
+                   onchange="window.h3dBgSetShowFretOnNote && window.h3dBgSetShowFretOnNote(this.checked)"
+                   class="accent-accent">
+            Show fret numbers on notes
+        </label>
+    </div>
 
     <!-- Hydrate from localStorage on load. Mirror runtime defaults AND
          coercion rules from screen.js's BG_DEFAULTS / _bgCoerce so first-
@@ -69,7 +86,7 @@
          no-selection / NaN state. -->
     <script>
         (function () {
-            const DEFAULTS = { style: 'particles', intensity: 0.5, reactive: true, palette: 'default' };
+            const DEFAULTS = { style: 'particles', intensity: 0.5, reactive: true, palette: 'default', showFretOnNote: false };
             const VALID_STYLES = new Set(['off', 'particles', 'silhouettes', 'lights', 'geometric']);
             const VALID_PALETTES = new Set(['default', 'neon', 'pastel']);
 
@@ -80,36 +97,40 @@
                 if (!Number.isFinite(n)) return DEFAULTS.intensity;
                 return Math.max(0, Math.min(1, n));
             }
-            function coerceReactive(v) {
-                if (v === null || v === undefined) return DEFAULTS.reactive;
+            function coerceBool(v, fallback) {
+                if (v === null || v === undefined) return fallback;
                 if (v === 'true'  || v === '1') return true;
                 if (v === 'false' || v === '0') return false;
-                return DEFAULTS.reactive;
+                return fallback;
             }
 
-            let storedStyle = null, storedI = null, storedR = null, storedPalette = null;
+            let storedStyle = null, storedI = null, storedR = null, storedPalette = null, storedFretOnNote = null;
             try {
                 storedStyle = localStorage.getItem('h3d_bg_style');
                 storedI = localStorage.getItem('h3d_bg_intensity');
                 storedR = localStorage.getItem('h3d_bg_reactive');
                 storedPalette = localStorage.getItem('h3d_bg_palette');
+                storedFretOnNote = localStorage.getItem('h3d_bg_showFretOnNote');
             } catch (_) { /* storage blocked */ }
 
             const style = coerceStyle(storedStyle);
             const intensity = coerceIntensity(storedI);
-            const reactive = coerceReactive(storedR);
+            const reactive = coerceBool(storedR, DEFAULTS.reactive);
             const palette = coercePalette(storedPalette);
+            const showFretOnNote = coerceBool(storedFretOnNote, DEFAULTS.showFretOnNote);
 
             const sel = document.getElementById('h3d-bg-style');
             const sli = document.getElementById('h3d-bg-intensity');
             const lbl = document.getElementById('h3d-bg-intensity-label');
             const rea = document.getElementById('h3d-bg-reactive');
             const pal = document.getElementById('h3d-palette');
+            const fon = document.getElementById('h3d-show-fret-on-note');
             if (sel) sel.value = style;
             if (sli) sli.value = String(intensity);
             if (lbl) lbl.textContent = intensity.toFixed(2);
             if (pal) pal.value = palette;
             if (rea) rea.checked = reactive;
+            if (fon) fon.checked = showFretOnNote;
         })();
     </script>
 </div>
