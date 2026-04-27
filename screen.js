@@ -283,8 +283,8 @@
         return _bgBandsCache;
     }
 
-    const BG_DEFAULTS = { style: 'particles', intensity: 0.5, reactive: true, palette: 'default', showFretOnNote: false };
-    const BG_STYLE_IDS = ['off', 'particles', 'silhouettes', 'lights', 'geometric'];
+    const BG_DEFAULTS = { style: 'particles', intensity: 0.5, reactive: true, palette: 'default', showFretOnNote: false, customImageDataUrl: '', customImageName: '' };
+    const BG_STYLE_IDS = ['off', 'particles', 'silhouettes', 'lights', 'geometric', 'image'];
 
     function _bgPanelKey(canvas) {
         const ss = window.slopsmithSplitscreen;
@@ -300,13 +300,30 @@
     // just picked in settings.html.
     const _bgMemFallback = Object.create(null);
     function _bgReadSetting(panelKey, key) {
+        // Per-panel override wins first, since per-panel state isn't
+        // staged in _bgMemFallback (only the global setters write
+        // there). A manual h3d_bg_panel<idx>_* edit should still
+        // override the global as designed.
         try {
             const panelVal = localStorage.getItem('h3d_bg_' + panelKey + '_' + key);
             if (panelVal !== null && panelVal !== undefined) return _bgCoerce(key, panelVal);
+        } catch (_) { /* storage blocked — fall through */ }
+        // For the global slot: check the in-memory fallback BEFORE
+        // localStorage. The setter populates _bgMemFallback even when
+        // localStorage.setItem fails on quota, so a failed write
+        // would otherwise leave the renderer pointed at the stale
+        // localStorage value while the UI shows the new selection
+        // (a 1.5 MB custom image staged in localStorage can push the
+        // origin near quota, then the next style/intensity change
+        // silently fails to apply in-session). Since the in-memory
+        // fallback is only populated AFTER a write attempt, fresh
+        // page loads still fall through to localStorage and pick up
+        // persisted user settings.
+        if (key in _bgMemFallback) return _bgCoerce(key, _bgMemFallback[key]);
+        try {
             const globalVal = localStorage.getItem('h3d_bg_' + key);
             if (globalVal !== null && globalVal !== undefined) return _bgCoerce(key, globalVal);
-        } catch (_) { /* storage blocked — fall through to in-memory */ }
-        if (key in _bgMemFallback) return _bgCoerce(key, _bgMemFallback[key]);
+        } catch (_) { /* storage blocked */ }
         return BG_DEFAULTS[key];
     }
     // Shared "stored string -> bool" coercion for every boolean
@@ -358,6 +375,20 @@
     window.h3dBgSetReactive  = (v) => _bgWriteGlobal('reactive', !!v);
     window.h3dBgSetPalette   = (v) => _bgWriteGlobal('palette', v);
     window.h3dBgSetShowFretOnNote = (v) => _bgWriteGlobal('showFretOnNote', !!v);
+    // Custom image asset for the 'image' bg style (#19). Composite setter:
+    // writes both the data URL (the bytes that drive the texture) and the
+    // display filename, each emitting a change event. The listener
+    // rebuilds on customImageDataUrl change when the image style is
+    // active; customImageName is display-only and skips rebuild.
+    window.h3dBgSetCustomImage = (asset) => {
+        const a = asset || {};
+        _bgWriteGlobal('customImageDataUrl', a.dataUrl || '');
+        _bgWriteGlobal('customImageName', a.name || '');
+    };
+    window.h3dBgClearCustomImage = () => {
+        _bgWriteGlobal('customImageDataUrl', '');
+        _bgWriteGlobal('customImageName', '');
+    };
     // Back-compat alias for any caller that picked up the original
     // (inconsistent) name during this PR's review window.
     window.h3dSetPalette     = window.h3dBgSetPalette;
@@ -642,6 +673,188 @@
                 }
             },
         },
+        // Custom image backdrop (#19). User uploads a JPG/PNG/WebP
+        // through settings.html; the bytes are persisted as a base64
+        // data URL in localStorage under h3d_bg_customImageDataUrl and
+        // passed in via settings.customImageDataUrl. Renders as a
+        // PlaneGeometry in the silhouette parallax band, "cover" cropped
+        // (via texture.repeat / offset) so non-matching aspects fill
+        // the plane without distortion. Slow horizontal drift on
+        // texture.offset.x for life. When no asset is uploaded, build
+        // returns null and the style is inert (settings.html disables
+        // the picker option in that case).
+        image: {
+            build(scene, settings) {
+                // Upfront validation: only accept the same raster image
+                // formats settings.html lets the user upload (jpeg /
+                // png / webp). Without this, a corrupt localStorage
+                // value (truncated base64, wrong scheme, plain string)
+                // OR an unsupported type (e.g. data:image/svg+xml)
+                // reaches TextureLoader and can fail asynchronously
+                // after the plane has been mounted — a silent black
+                // backdrop with no clear cause. Returning null here
+                // treats invalid bytes the same as "no asset uploaded":
+                // style is inert, the user can clear and re-upload
+                // from settings.html.
+                const dataUrl = (typeof settings.customImageDataUrl === 'string')
+                    ? settings.customImageDataUrl.trim() : '';
+                if (!/^data:image\/(jpeg|png|webp);/i.test(dataUrl)) return null;
+                // Renderer-side encoded-length cap. settings.html
+                // enforces the same limit on upload, but a manually
+                // edited localStorage value (or legacy data from
+                // before the upload guard existed) could still feed
+                // an arbitrarily large data URL into TextureLoader
+                // and burn memory / CPU during decode. Treat overlong
+                // values as "no asset" — style is inert, user can
+                // clear and re-upload from settings.
+                if (dataUrl.length > 2.5 * 1024 * 1024) return null;
+                const planeW = 400 * K, planeH = 120 * K;
+                const planeAspect = planeW / planeH;
+                // Renderer-side decompression-bomb caps. Mirror
+                // settings.html's upload-time guard so a manual
+                // localStorage edit (or legacy data from before that
+                // guard existed) can't sneak a 50000×50000 PNG past
+                // and OOM the GPU on texture upload.
+                const MAX_IMAGE_DIM = 4096;
+                const MAX_IMAGE_PIXELS = 16 * 1024 * 1024;
+                // Build the state object upfront so async TextureLoader
+                // callbacks can write back into it (loaded flag, mesh
+                // visibility, drift reset). update() reads s.loaded
+                // before advancing drift, which keeps the initial
+                // texture offset deterministic regardless of how long
+                // the async decode takes.
+                const state = {
+                    mesh: null, geo: null, mat: null, tex: null,
+                    drift: 0.5, intensity: settings.intensity, loaded: false,
+                };
+                const tex = new T.TextureLoader().load(
+                    dataUrl,
+                    (loaded) => {
+                        // Image dimensions are only known after async decode.
+                        const imgW = loaded.image?.width  || 0;
+                        const imgH = loaded.image?.height || 0;
+                        if (imgW > MAX_IMAGE_DIM || imgH > MAX_IMAGE_DIM || (imgW * imgH) > MAX_IMAGE_PIXELS) {
+                            // Bail before the texture gets uploaded to
+                            // the GPU (Three.js uploads on first render
+                            // of a visible mesh — hiding the mesh here
+                            // skips that). Disposing the texture too,
+                            // belt-and-suspenders, in case anything
+                            // else holds a reference.
+                            console.warn('[3D-Hwy] custom image dimensions too large to render', imgW + 'x' + imgH);
+                            if (state.mesh) state.mesh.visible = false;
+                            loaded.dispose();
+                            return;
+                        }
+                        // Cover-crop: smaller repeat = more zoom on the
+                        // image (shows a fraction of the texture
+                        // stretched across the plane), which is the right
+                        // tool for "fill plane, crop overflow".
+                        if (imgW > 0 && imgH > 0) {
+                            const imgAspect = imgW / imgH;
+                            if (imgAspect > planeAspect) {
+                                loaded.repeat.x = planeAspect / imgAspect;
+                                loaded.offset.x = (1 - loaded.repeat.x) * 0.5;
+                            } else {
+                                loaded.repeat.y = imgAspect / planeAspect;
+                                loaded.offset.y = (1 - loaded.repeat.y) * 0.5;
+                            }
+                            loaded.needsUpdate = true;
+                        }
+                        // Reset drift to the centered triangle-wave
+                        // phase now that repeat.x is final. Without
+                        // this reset, drift accumulated during the
+                        // async decode would phase-shift the initial
+                        // offset by a non-deterministic amount —
+                        // wider images would open at whatever crop
+                        // the elapsed-decode-time happened to land on.
+                        state.drift = 0.5;
+                        state.loaded = true;
+                    },
+                    undefined,
+                    // Async-failure path: the upfront regex catches the
+                    // common "corrupted/truncated bytes" case, but a
+                    // valid-looking data URL can still fail to decode
+                    // (e.g. wrong MIME / unsupported codec). Hide the
+                    // mesh so we don't paint a frozen blank plane on
+                    // top of fog, and log so the failure isn't silent.
+                    (err) => {
+                        console.error('[3D-Hwy] custom image decode failed', err);
+                        if (state.mesh) state.mesh.visible = false;
+                    },
+                );
+                tex.colorSpace = T.SRGBColorSpace;
+                // ClampToEdge on both axes — user uploads are non-
+                // power-of-two in general, and WebGL1 rejects RepeatWrapping
+                // on NPOT textures (renders black or emits GL errors). The
+                // drift logic below uses a triangle-wave so the offset
+                // stays inside [0, 1-repeat] and never needs wrap.
+                tex.wrapS = T.ClampToEdgeWrapping;
+                tex.wrapT = T.ClampToEdgeWrapping;
+                // User uploads aren't power-of-two in general; mipmaps
+                // are noisy for a single static backdrop and burn memory.
+                tex.generateMipmaps = false;
+                tex.minFilter = T.LinearFilter;
+                tex.magFilter = T.LinearFilter;
+                const geo = new T.PlaneGeometry(planeW, planeH);
+                const mat = new T.MeshBasicMaterial({
+                    map: tex, transparent: false, depthWrite: false, fog: true,
+                });
+                const mesh = new T.Mesh(geo, mat);
+                // z = -FOG_END * 0.7 matches silhouette layer 2 (-0.70)
+                // so the image reads as part of the same parallax band.
+                // The image and silhouette styles are mutually exclusive
+                // (only one bg style mounts at a time), so co-planarity
+                // is fine — no z-fighting risk. y = 5*K lifts it
+                // slightly so the plane center aligns with the upper
+                // fog band (silhouettes sit at y = -10*K).
+                mesh.position.set(0, 5 * K, -FOG_END * 0.7);
+                scene.add(mesh);
+                state.mesh = mesh;
+                state.geo  = geo;
+                state.mat  = mat;
+                state.tex  = tex;
+                return state;
+            },
+            update(s, bands, dt) {
+                if (!s) return;
+                // Skip drift advance until the texture has finished
+                // decoding. Without this guard, drift accumulates
+                // during the async load while repeat.x is still 1
+                // (its default), and once the cover-crop applies the
+                // image opens at a phase-shifted offset whose value
+                // depends on how long the decode took — the
+                // "centered start" intent becomes non-deterministic.
+                if (!s.loaded) return;
+                // Triangle-wave ping-pong drift inside the cropped slack.
+                // ClampToEdge on wrapS means we cannot wrap across the
+                // texture boundary (would render edge pixels stretched);
+                // ping-pong oscillates the visible window between the
+                // image's left and right edges, which gives the same
+                // "alive" feel without the WebGL1 NPOT-Repeat hazard.
+                // Slack is the horizontal margin between the cropped
+                // window and the texture edges; for taller-than-plane
+                // images repeat.x stays 1, slack collapses to 0, and
+                // the offset stays at 0 — the image sits still, which
+                // is correct (it's already filling horizontally).
+                s.drift += dt * 0.02 * s.intensity;
+                const slack = Math.max(0, 1 - s.tex.repeat.x);
+                // Period of 2 drift units ≈ 100 s at intensity = 0.5;
+                // gentle, cinematic. cyc ∈ [0, 2), tri ∈ [0, 1] then back.
+                const cyc = ((s.drift % 2) + 2) % 2;
+                const tri = cyc < 1 ? cyc : 2 - cyc;
+                s.tex.offset.x = tri * slack;
+            },
+            teardown(s) {
+                if (!s) return;
+                s.mesh.parent && s.mesh.parent.remove(s.mesh);
+                s.geo.dispose();
+                s.mat.dispose();
+                // This style owns the texture lifecycle (per the comment
+                // at _bgDisposeGroupTree: tree dispose does NOT touch
+                // material.map textures).
+                s.tex.dispose();
+            },
+        },
     };
 
     /* ======================================================================
@@ -702,6 +915,11 @@
         // by default — opt-in setting for players who like the at-a-
         // glance fret cue.
         let showFretOnNote = false;
+        // Custom image asset (issue #19). Data URL is the bytes that
+        // drive the 'image' bg style's texture; name is display-only
+        // metadata that settings.html shows next to the file picker.
+        let bgCustomImageDataUrl = '';
+        let bgCustomImageName = '';
         let _bgListener = null;
         let _bgLastT = 0;  // ms timestamp for dt
 
@@ -1230,7 +1448,36 @@
                     if (bgStyleId === 'lights') _bgRebuild();
                     return;
                 }
-                if (!changedKey || changedKey === 'style' || changedKey === 'intensity') {
+                if (changedKey === 'customImageDataUrl') {
+                    // Asset bytes changed. Rebuild only when the image
+                    // style is active — otherwise the new bytes will
+                    // pick up next time the user picks `image`.
+                    _bgLoadSettings();
+                    if (bgStyleId === 'image') _bgRebuild();
+                    return;
+                }
+                if (changedKey === 'customImageName') {
+                    // Display-only metadata; no mesh rebuild.
+                    _bgLoadSettings();
+                    return;
+                }
+                if (changedKey === 'intensity') {
+                    _bgLoadSettings();
+                    // Image style reads s.intensity per frame inside
+                    // update() to scale the drift speed, so a live
+                    // mutation is enough — no need to tear down and
+                    // re-decode the texture for every slider change.
+                    // The procedural styles bake intensity into mesh
+                    // count, opacity, and size at build time, so they
+                    // still need a full rebuild.
+                    if (bgStyleId === 'image' && bgState) {
+                        bgState.intensity = bgIntensity;
+                        return;
+                    }
+                    _bgRebuild();
+                    return;
+                }
+                if (!changedKey || changedKey === 'style') {
                     _bgRebuild();
                 }
             };
@@ -1292,6 +1539,34 @@
                 _applyPaletteToMaterials();
             }
             showFretOnNote = _bgReadSetting(panelKey, 'showFretOnNote');
+            // Custom image asset is a single GLOBAL slot — bytes are
+            // shared across panels (per-panel choice is which style
+            // each panel renders, not which asset). Reading via
+            // _bgReadSetting would let a stray h3d_bg_panel<idx>_*
+            // override silently re-introduce the per-panel asset
+            // duplication this design deliberately avoids (and
+            // h3dBgClearCustomImage wouldn't reach those overrides).
+            // Read globals directly instead.
+            //
+            // Precedence: in-memory fallback BEFORE localStorage. The
+            // setter always populates _bgMemFallback (even when the
+            // localStorage write fails on quota), so the fallback
+            // holds the most-recent staged value. Reading localStorage
+            // first would mean a failed write leaves the renderer
+            // pointed at the previous asset while settings.html shows
+            // a "session-only" warning claiming the new bytes are in
+            // effect — UI and renderer would silently disagree.
+            const memDataUrl = _bgMemFallback.customImageDataUrl;
+            const memName    = _bgMemFallback.customImageName;
+            try {
+                const gDataUrl = (memDataUrl !== undefined) ? memDataUrl : localStorage.getItem('h3d_bg_customImageDataUrl');
+                const gName    = (memName    !== undefined) ? memName    : localStorage.getItem('h3d_bg_customImageName');
+                bgCustomImageDataUrl = (gDataUrl != null) ? gDataUrl : BG_DEFAULTS.customImageDataUrl;
+                bgCustomImageName    = (gName    != null) ? gName    : BG_DEFAULTS.customImageName;
+            } catch (_) {
+                bgCustomImageDataUrl = (memDataUrl !== undefined) ? memDataUrl : BG_DEFAULTS.customImageDataUrl;
+                bgCustomImageName    = (memName    !== undefined) ? memName    : BG_DEFAULTS.customImageName;
+            }
         }
         // Live-swap palette by mutating existing materials in place.
         // Three.js colors propagate to all sharing meshes on the next
@@ -1339,7 +1614,11 @@
             const stage = new T.Group();
             let result = null;
             try {
-                result = style.build(stage, { intensity: bgIntensity, palette: activePalette }) || null;
+                result = style.build(stage, {
+                    intensity: bgIntensity,
+                    palette: activePalette,
+                    customImageDataUrl: bgCustomImageDataUrl,
+                }) || null;
             } catch (e) {
                 console.error('[3D-Hwy] bg style build failed', bgStyleId, e);
                 _bgDisposeGroupTree(stage);

@@ -37,6 +37,7 @@
             <option value="silhouettes">Silhouettes (parallax)</option>
             <option value="lights">Lights (stage glows)</option>
             <option value="geometric">Geometric (rotating shapes)</option>
+            <option value="image" disabled>Custom image (none uploaded)</option>
         </select>
     </div>
 
@@ -59,6 +60,29 @@
                    class="accent-accent">
             React to audio
         </label>
+    </div>
+
+    <!-- Custom image upload (#19). Persisted in localStorage under
+         h3d_bg_customImageDataUrl (the base64 data URL that drives
+         the texture) and h3d_bg_customImageName (display-only
+         filename). Renders as the `image` bg style; the picker
+         option above auto-enables once an asset is uploaded. -->
+    <div class="mt-3">
+        <label for="h3d-bg-custom-image-file" class="text-xs font-medium text-gray-400 mb-1 block">Custom image</label>
+        <p class="text-xs text-gray-500 mb-2">
+            Upload a JPG/PNG/WebP (&le;1.5&nbsp;MB). Renders as a slowly
+            drifting backdrop in the fog band when the style above is set
+            to <em>Custom image</em>.
+        </p>
+        <div class="flex items-center gap-2">
+            <input type="file" id="h3d-bg-custom-image-file"
+                   accept="image/png,image/jpeg,image/webp"
+                   class="text-xs text-gray-300 file:mr-2 file:px-2 file:py-1 file:rounded file:border-0 file:bg-dark-600 file:text-gray-300">
+            <button type="button" id="h3d-bg-custom-image-clear"
+                    class="text-xs px-2 py-1 rounded bg-dark-700 border border-gray-800 text-gray-400 hover:text-gray-200">Clear</button>
+        </div>
+        <p id="h3d-bg-custom-image-name" class="text-xs text-gray-500 mt-1"></p>
+        <p id="h3d-bg-custom-image-error" class="text-xs text-red-400 mt-1 hidden"></p>
     </div>
 </div>
 
@@ -86,9 +110,42 @@
          no-selection / NaN state. -->
     <script>
         (function () {
-            const DEFAULTS = { style: 'particles', intensity: 0.5, reactive: true, palette: 'default', showFretOnNote: false };
-            const VALID_STYLES = new Set(['off', 'particles', 'silhouettes', 'lights', 'geometric']);
+            const DEFAULTS = { style: 'particles', intensity: 0.5, reactive: true, palette: 'default', showFretOnNote: false, customImageDataUrl: '', customImageName: '' };
+            const VALID_STYLES = new Set(['off', 'particles', 'silhouettes', 'lights', 'geometric', 'image']);
             const VALID_PALETTES = new Set(['default', 'neon', 'pastel']);
+            // Custom images are persisted as base64 data URLs in
+            // localStorage. base64 expands the byte count by ~4/3, and
+            // localStorage values are stored as UTF-16 (two bytes per
+            // character), so the on-disk footprint is ~2.67× the raw
+            // file size. localStorage quotas are typically 5 MB per
+            // origin and slopsmith already uses some of that for other
+            // settings, so a 1.5 MB raw limit (≈4 MB on disk) leaves
+            // safe headroom; the read-back verification below catches
+            // remaining edge cases where the write still gets refused.
+            const MAX_IMAGE_BYTES = Math.floor(1.5 * 1024 * 1024);
+            // Hard cap on the encoded data URL length as a second line
+            // of defense. base64 expands raw by ~4/3, so a max-size
+            // (1.5 MB) upload encodes to ~2.0 M chars + a short
+            // `data:image/...;base64,` prefix. 2.5 M chars gives ~25%
+            // headroom to catch outliers without ever firing on
+            // legitimate uploads that already pass MAX_IMAGE_BYTES.
+            // Mirrored in screen.js as a renderer-side guard against
+            // legacy / manually-edited localStorage payloads.
+            const MAX_DATA_URL_CHARS = Math.floor(2.5 * 1024 * 1024);
+            // Strict whitelist of allowed file MIME types, matching the
+            // file picker's `accept` attribute and screen.js's
+            // upfront `^data:image/(jpeg|png|webp);` validator.
+            const ALLOWED_IMAGE_MIMES = new Set(['image/jpeg', 'image/png', 'image/webp']);
+            // Defense against decompression bombs — a small ≤1.5 MB
+            // file can decode to enormous pixel dimensions (e.g.
+            // 50000×50000), which would allocate gigabytes of GPU
+            // memory once Three.js uploads it as a texture and almost
+            // certainly crash the tab. 4096 per axis is plenty for a
+            // backdrop (more pixels are wasted at fog-band distance);
+            // 16 MP total catches non-square shapes that pass the
+            // per-axis cap but still aggregate to a huge area.
+            const MAX_IMAGE_DIM = 4096;
+            const MAX_IMAGE_PIXELS = 16 * 1024 * 1024;
 
             function coerceStyle(v) { return VALID_STYLES.has(v) ? v : DEFAULTS.style; }
             function coercePalette(v) { return VALID_PALETTES.has(v) ? v : DEFAULTS.palette; }
@@ -105,12 +162,15 @@
             }
 
             let storedStyle = null, storedI = null, storedR = null, storedPalette = null, storedFretOnNote = null;
+            let storedCustomImageDataUrl = null, storedCustomImageName = null;
             try {
                 storedStyle = localStorage.getItem('h3d_bg_style');
                 storedI = localStorage.getItem('h3d_bg_intensity');
                 storedR = localStorage.getItem('h3d_bg_reactive');
                 storedPalette = localStorage.getItem('h3d_bg_palette');
                 storedFretOnNote = localStorage.getItem('h3d_bg_showFretOnNote');
+                storedCustomImageDataUrl = localStorage.getItem('h3d_bg_customImageDataUrl');
+                storedCustomImageName = localStorage.getItem('h3d_bg_customImageName');
             } catch (_) { /* storage blocked */ }
 
             const style = coerceStyle(storedStyle);
@@ -118,6 +178,8 @@
             const reactive = coerceBool(storedR, DEFAULTS.reactive);
             const palette = coercePalette(storedPalette);
             const showFretOnNote = coerceBool(storedFretOnNote, DEFAULTS.showFretOnNote);
+            const customImageDataUrl = (typeof storedCustomImageDataUrl === 'string') ? storedCustomImageDataUrl : DEFAULTS.customImageDataUrl;
+            const customImageName    = (typeof storedCustomImageName === 'string')    ? storedCustomImageName    : DEFAULTS.customImageName;
 
             const sel = document.getElementById('h3d-bg-style');
             const sli = document.getElementById('h3d-bg-intensity');
@@ -125,12 +187,190 @@
             const rea = document.getElementById('h3d-bg-reactive');
             const pal = document.getElementById('h3d-palette');
             const fon = document.getElementById('h3d-show-fret-on-note');
-            if (sel) sel.value = style;
+            const fileInput = document.getElementById('h3d-bg-custom-image-file');
+            const clearBtn  = document.getElementById('h3d-bg-custom-image-clear');
+            const nameP     = document.getElementById('h3d-bg-custom-image-name');
+            const errorP    = document.getElementById('h3d-bg-custom-image-error');
             if (sli) sli.value = String(intensity);
             if (lbl) lbl.textContent = intensity.toFixed(2);
             if (pal) pal.value = palette;
             if (rea) rea.checked = reactive;
             if (fon) fon.checked = showFretOnNote;
+
+            function imageOption() {
+                if (!sel) return null;
+                for (let i = 0; i < sel.options.length; i++) {
+                    if (sel.options[i].value === 'image') return sel.options[i];
+                }
+                return null;
+            }
+            // Reflect "is there an asset?" in the picker. Keeping this
+            // tied to data presence (rather than a separate flag) means
+            // a clear-then-refresh cycle stays consistent without extra
+            // bookkeeping.
+            function refreshImageOptionState(hasAsset, displayName) {
+                const opt = imageOption();
+                if (opt) {
+                    opt.disabled = !hasAsset;
+                    opt.textContent = hasAsset
+                        ? ('Custom image' + (displayName ? ' — ' + displayName : ''))
+                        : 'Custom image (none uploaded)';
+                }
+                if (nameP) nameP.textContent = hasAsset
+                    ? ('Current: ' + (displayName || 'unnamed'))
+                    : 'No image uploaded.';
+            }
+            function showError(msg) {
+                if (!errorP) return;
+                errorP.textContent = msg;
+                errorP.classList.remove('hidden');
+            }
+            function clearError() {
+                if (!errorP) return;
+                errorP.textContent = '';
+                errorP.classList.add('hidden');
+            }
+
+            // hasAsset must use the same validator as screen.js. A bare
+            // truthy check would treat whitespace, garbage strings, or
+            // unsupported types (e.g. data:image/svg+xml left over from
+            // an older version's storage) as "asset present" and let
+            // the UI enable + select the `image` option, but the
+            // renderer would reject the bytes and mount nothing —
+            // leaving the user with a non-functional selection and a
+            // blank backdrop they couldn't diagnose.
+            const trimmedCustomImageDataUrl = (typeof customImageDataUrl === 'string')
+                ? customImageDataUrl.trim() : '';
+            const hasAsset = /^data:image\/(jpeg|png|webp);/i.test(trimmedCustomImageDataUrl);
+            refreshImageOptionState(hasAsset, customImageName);
+
+            // Apply style AFTER the image option's disabled state is
+            // settled. If style === 'image' but no asset is uploaded
+            // (corrupt localStorage, manual edit), persist the fallback
+            // through the setter so storage / UI / renderer all agree
+            // — without the setter call we'd leave h3d_bg_style=image
+            // in localStorage while the picker shows particles, and
+            // the renderer would mount the inert image style (build
+            // returns null) for a blank backdrop that doesn't match
+            // the visible UI selection.
+            if (sel) {
+                if (style === 'image' && !hasAsset) {
+                    sel.value = DEFAULTS.style;
+                    if (window.h3dBgSetStyle) window.h3dBgSetStyle(DEFAULTS.style);
+                } else {
+                    sel.value = style;
+                }
+            }
+
+            if (fileInput) {
+                fileInput.addEventListener('change', function () {
+                    clearError();
+                    const file = fileInput.files && fileInput.files[0];
+                    if (!file) return;
+                    if (file.size > MAX_IMAGE_BYTES) {
+                        showError('Image must be ≤1.5 MB (got ' + (file.size / 1024 / 1024).toFixed(1) + ' MB).');
+                        fileInput.value = '';
+                        return;
+                    }
+                    // Strict MIME whitelist matching the picker's
+                    // accept attribute and the renderer-side validator
+                    // in screen.js. Rejecting SVG/GIF/etc. here keeps
+                    // the UI, the persisted bytes, and what the
+                    // texture loader will accept all in agreement —
+                    // and avoids any SVG-via-img surface area we
+                    // don't need for a backdrop image.
+                    if (!ALLOWED_IMAGE_MIMES.has(file.type)) {
+                        showError('File must be a JPG, PNG, or WebP image.');
+                        fileInput.value = '';
+                        return;
+                    }
+                    const reader = new FileReader();
+                    reader.onerror = function () {
+                        showError('Could not read file.');
+                        fileInput.value = '';
+                    };
+                    reader.onload = function () {
+                        const dataUrl = reader.result;
+                        if (typeof dataUrl !== 'string') {
+                            showError('Unexpected file content.');
+                            fileInput.value = '';
+                            return;
+                        }
+                        if (dataUrl.length > MAX_DATA_URL_CHARS) {
+                            // Pre-decode reject when the encoded form
+                            // is plainly too large for storage. Avoids
+                            // a confusing "applied but won't persist"
+                            // message when the image is so large that
+                            // localStorage could never have held it.
+                            showError('Image is too large after encoding to save. Try a smaller file.');
+                            fileInput.value = '';
+                            return;
+                        }
+                        // Probe the bytes by attempting to decode them.
+                        // Catches mis-typed files (e.g. .txt renamed to
+                        // .png) and corrupt uploads BEFORE we persist
+                        // them, so the user gets a clear error instead
+                        // of a silent broken backdrop.
+                        const probe = new Image();
+                        probe.onload = function () {
+                            // Decompression-bomb guard. Decoded
+                            // dimensions are only known here, after
+                            // probe.onload — small files can hide
+                            // enormous pixel counts. Reject before
+                            // persisting OR triggering the renderer
+                            // load, so we never get past the data URL
+                            // sitting in localStorage to the GPU
+                            // texture upload that would crash the tab.
+                            const w = probe.naturalWidth  || 0;
+                            const h = probe.naturalHeight || 0;
+                            if (w > MAX_IMAGE_DIM || h > MAX_IMAGE_DIM || (w * h) > MAX_IMAGE_PIXELS) {
+                                showError('Image dimensions are too large (' + w + '×' + h + '). Max ' + MAX_IMAGE_DIM + '×' + MAX_IMAGE_DIM + '.');
+                                fileInput.value = '';
+                                return;
+                            }
+                            if (window.h3dBgSetCustomImage) {
+                                window.h3dBgSetCustomImage({ dataUrl: dataUrl, name: file.name });
+                            }
+                            // The setter swallows localStorage write
+                            // failures (sets in-memory fallback so the
+                            // current session still works) — re-read
+                            // and verify to surface a real "won't
+                            // persist" warning when the bytes didn't
+                            // make it to disk. The image is still
+                            // applied for this session in either case,
+                            // so we always refresh the UI.
+                            refreshImageOptionState(true, file.name);
+                            fileInput.value = '';
+                            let persisted = false;
+                            try { persisted = localStorage.getItem('h3d_bg_customImageDataUrl') === dataUrl; } catch (_) { /* storage blocked */ }
+                            if (!persisted) {
+                                showError('Image applied for this session, but could not be saved (storage may be full or blocked). It will be lost on refresh.');
+                            }
+                        };
+                        probe.onerror = function () {
+                            showError('Image could not be decoded. Try a different file.');
+                            fileInput.value = '';
+                        };
+                        probe.src = dataUrl;
+                    };
+                    reader.readAsDataURL(file);
+                });
+            }
+            if (clearBtn) {
+                clearBtn.addEventListener('click', function () {
+                    clearError();
+                    if (window.h3dBgClearCustomImage) window.h3dBgClearCustomImage();
+                    refreshImageOptionState(false, '');
+                    if (fileInput) fileInput.value = '';
+                    // If the picker was on `image`, fall back to a
+                    // procedural style so the user isn't left with the
+                    // (now-disabled) option selected.
+                    if (sel && sel.value === 'image') {
+                        sel.value = DEFAULTS.style;
+                        if (window.h3dBgSetStyle) window.h3dBgSetStyle(DEFAULTS.style);
+                    }
+                });
+            }
         })();
     </script>
 </div>
