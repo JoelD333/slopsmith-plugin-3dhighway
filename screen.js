@@ -656,6 +656,11 @@
         let gNote = null, gSus = null, gBeat = null;
         let mStr = [], mGlow = [], mSus = [], mProj = [], mProjGlow = [];
         let mWhiteOutline = null, mSusOutline = null;
+        // Notedetect feedback outlines (issue #9). Created in initScene
+        // alongside mWhiteOutline; swapped onto the note's outline mesh
+        // when a recent notedetect:hit / :miss event matches the note's
+        // (s, f, t).
+        let mHitOutline = null, mMissOutline = null;
         let pSusOutline = null;
         let projMeshArr = null, projGlowArr = null;
         let _probe = null;
@@ -686,6 +691,23 @@
         let activePalette = PALETTES.default;
         let _bgListener = null;
         let _bgLastT = 0;  // ms timestamp for dt
+
+        // Notedetect feedback (issue #9). Per-panel mark queues populated
+        // by `notedetect:hit` / `notedetect:miss` window events. drawNote
+        // looks up its (s, f, t) against these arrays each frame and
+        // swaps the outline material when a match is current. Marks
+        // expire after _ND_TTL_MS so the visual flash is brief. Marks
+        // self-prune lazily in the listener to keep the arrays small.
+        const _ND_TTL_MS = 500;
+        const _ND_TIME_EPS = 0.01;
+        let _ndHitMarks = [];
+        let _ndMissMarks = [];
+        let _ndOnHit = null, _ndOnMiss = null;
+        // Per-frame timestamp captured by update() and used by its
+        // prune pass for the notedetect mark arrays. drawNote itself
+        // no longer reads it — pruning lives once per frame so
+        // drawNote's hot path is just the bounded (s, f, t) match.
+        let _ndFrameNowMs = 0;
 
         // Object pools
         let pNote, pSus, pLbl, pBeat, pSec;
@@ -1074,6 +1096,12 @@
                 color: c, transparent: true, opacity: 0.35,
             }));
             mWhiteOutline = new T.MeshLambertMaterial({ color: 0xffffff, emissive: 0xffffff, emissiveIntensity: 0.6 });
+            // Notedetect feedback (issue #9): bright green / red outline
+            // tints. Note rendering swaps its outline.material between
+            // mWhiteOutline / mHitOutline / mMissOutline based on
+            // recent notedetect events.
+            mHitOutline   = new T.MeshLambertMaterial({ color: 0x40ff70, emissive: 0x40ff70, emissiveIntensity: 1.0 });
+            mMissOutline  = new T.MeshLambertMaterial({ color: 0xff4040, emissive: 0xff4040, emissiveIntensity: 1.0 });
             mSusOutline   = new T.MeshLambertMaterial({ color: 0xffffff, emissive: 0xffffff, emissiveIntensity: 0.3, transparent: true, opacity: 0.75, depthWrite: false });
             mBeatM = new T.LineBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.25 });
             mBeatQ = new T.LineBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.07 });
@@ -1193,6 +1221,47 @@
                 }
             };
             _bgSubscribe(_bgListener);
+
+            // Notedetect feedback (#9). Listen for hit/miss events on
+            // window. Notedetect dispatches both globally and on its
+            // instanceRoot; the global fire is fine for our case since
+            // each 3dhighway panel just stores any event into its own
+            // queue and renders only the matching note. Listeners are
+            // per-panel so destroy() can cleanly remove them; cost is
+            // a per-event branch + push, negligible vs per-frame work.
+            // Validate every payload field we'll later compare against
+            // chart-data fields (s, f, t). drawNote compares with
+            // Math.abs(m.noteTime - n.t) and trusts the values are
+            // finite, so reject any payload missing one of those
+            // fields here rather than letting bogus data into the
+            // arrays. Prune expired marks on every push so the arrays
+            // settle back to empty when notedetect stops emitting —
+            // drawNote's fast-path short-circuit
+            // (`if (_ndHitMarks.length || _ndMissMarks.length)`) only
+            // works if expired entries don't linger.
+            const _ndPushMark = (arr, d) => {
+                if (!d || !d.note) return arr;
+                if (!Number.isFinite(d.note.s) || !Number.isFinite(d.note.f) || !Number.isFinite(d.noteTime)) return arr;
+                const now = performance.now();
+                // In-place prune only when the oldest mark is actually
+                // expired. Marks are pushed in chronological order so
+                // checking arr[0] tells us in O(1) whether anything
+                // needs to go. splice keeps the same array (no fresh
+                // allocation) — saves a per-event filter() copy in the
+                // common case where nothing has expired yet.
+                if (arr.length !== 0 && arr[0].expiresAt <= now) {
+                    let firstLive = 0;
+                    while (firstLive < arr.length && arr[firstLive].expiresAt <= now) firstLive++;
+                    if (firstLive >= arr.length) arr.length = 0;
+                    else arr.splice(0, firstLive);
+                }
+                arr.push({ s: d.note.s, f: d.note.f, noteTime: d.noteTime, expiresAt: now + _ND_TTL_MS });
+                return arr;
+            };
+            _ndOnHit  = (e) => { _ndHitMarks  = _ndPushMark(_ndHitMarks,  e.detail); };
+            _ndOnMiss = (e) => { _ndMissMarks = _ndPushMark(_ndMissMarks, e.detail); };
+            window.addEventListener('notedetect:hit',  _ndOnHit);
+            window.addEventListener('notedetect:miss', _ndOnMiss);
 
             return true;
         }
@@ -1430,6 +1499,18 @@
             if (projGlowArr) for (const m of projGlowArr) m.visible = false;
             pFretLbl.reset(); pLane.reset(); pLaneDivider.reset();
             pChordBox.reset(); pChordLbl.reset(); pBarreLine.reset(); pNoteFretLabel.reset(); pConnectorLine.reset(); pDropLine.reset();
+
+            // Prune expired notedetect marks once per frame instead of
+            // once per drawNote call (issue #9 perf nit). drawNote then
+            // only does the bounded (s, f, t) match — no per-note
+            // performance.now() / filter() needed.
+            _ndFrameNowMs = performance.now();
+            if (_ndHitMarks.length && _ndHitMarks[0].expiresAt <= _ndFrameNowMs) {
+                _ndHitMarks = _ndHitMarks.filter(m => m.expiresAt > _ndFrameNowMs);
+            }
+            if (_ndMissMarks.length && _ndMissMarks[0].expiresAt <= _ndFrameNowMs) {
+                _ndMissMarks = _ndMissMarks.filter(m => m.expiresAt > _ndFrameNowMs);
+            }
 
             const now = bundle.currentTime;
             const t0  = now - BEHIND;
@@ -1797,8 +1878,38 @@
                 const approachRot = n.f > 0 ? Math.max(0, Math.min(1, dt / AHEAD)) * Math.PI / 2 : 0;
 
                 // ── Outline (slightly larger, bright emissive) ────────────
+                // Notedetect feedback (#9): if a recent hit/miss event
+                // matches this note's (s, f, t), swap the outline tint.
+                // Linear scan over a small bounded array — typical
+                // queues are 0-5 entries, expired marks pruned by the
+                // listener. Hit takes precedence over miss so the user
+                // sees the more positive feedback if both happen
+                // (shouldn't, but cheap guard).
+                let _ndOutline = mWhiteOutline;
+                // update() prunes expired marks once per frame and
+                // caches performance.now() in _ndFrameNowMs so the hot
+                // path here just does the bounded match — no extra
+                // now() / filter() per note. After update()'s prune,
+                // every entry in the arrays has expiresAt > _ndFrameNowMs,
+                // so we don't re-validate inside the loop.
+                if (_ndHitMarks.length || _ndMissMarks.length) {
+                    for (let i = 0; i < _ndHitMarks.length; i++) {
+                        const m = _ndHitMarks[i];
+                        if (m.s === n.s && m.f === n.f && Math.abs(m.noteTime - n.t) < _ND_TIME_EPS) {
+                            _ndOutline = mHitOutline; break;
+                        }
+                    }
+                    if (_ndOutline === mWhiteOutline) {
+                        for (let i = 0; i < _ndMissMarks.length; i++) {
+                            const m = _ndMissMarks[i];
+                            if (m.s === n.s && m.f === n.f && Math.abs(m.noteTime - n.t) < _ND_TIME_EPS) {
+                                _ndOutline = mMissOutline; break;
+                            }
+                        }
+                    }
+                }
                 const outline = pNote.get();
-                outline.material = mWhiteOutline;
+                outline.material = _ndOutline;
                 outline.position.set(x, y + vibrato, noteZ);
                 outline.rotation.z = approachRot + (isHarm ? Math.PI / 4 : 0);
                 if (n.f === 0) {
@@ -2022,6 +2133,14 @@
             // mid-teardown settings change doesn't try to rebuild a torn-
             // down scene; then dispose the active style's resources.
             if (_bgListener) { _bgUnsubscribe(_bgListener); _bgListener = null; }
+            // Notedetect listeners (issue #9). Remove on destroy so a
+            // panel that stops doesn't keep accumulating marks. Marks
+            // arrays are cleared too — they hold stale chart positions
+            // that next init() may reuse (drawNote keys on (s, f, t)).
+            if (_ndOnHit)  { window.removeEventListener('notedetect:hit',  _ndOnHit);  _ndOnHit  = null; }
+            if (_ndOnMiss) { window.removeEventListener('notedetect:miss', _ndOnMiss); _ndOnMiss = null; }
+            _ndHitMarks = [];
+            _ndMissMarks = [];
             _bgUnmountStyle();
             bgGroup = null; _bgLastT = 0;
 
@@ -2051,6 +2170,10 @@
             for (const m of mProj)    m?.dispose?.();
             for (const m of mProjGlow) m?.dispose?.();
             mBeatM?.dispose?.(); mBeatQ?.dispose?.();
+            // Notedetect outline materials (#9). May not be reachable
+            // via scene.traverse if no event ever fired (never attached
+            // to a mesh), so dispose explicitly.
+            mHitOutline?.dispose?.(); mMissOutline?.dispose?.();
             for (const k in txtCache) { txtCache[k].map?.dispose(); txtCache[k].dispose(); }
             // Dispose per-sprite cloned materials (e.g. pmMark._pmMat).
             // These aren't reachable via scene.traverse once the sprite
@@ -2062,7 +2185,7 @@
             if (ren) { ren.dispose(); ren = null; }
             scene = cam = noteG = beatG = lblG = fretG = null;
             ambLight = dirLight = null;
-            mStr = []; mGlow = []; mSus = []; mProj = []; mProjGlow = []; mWhiteOutline = mSusOutline = null; stringLines = [];
+            mStr = []; mGlow = []; mSus = []; mProj = []; mProjGlow = []; mWhiteOutline = mSusOutline = null; mHitOutline = mMissOutline = null; stringLines = [];
             lyricsCanvas = lyricsCtx = null;
             projMeshArr = projGlowArr = null;
             _probe = null;
