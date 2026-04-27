@@ -16,17 +16,30 @@
     const CDN =
         'https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.min.js';
 
-    // Vibrant Rocksmith+ palette
-    const S_COL = [
-        0xfc2d5d, // String 1 — neon red/pink
-        0xffe100, // String 2 — bright lemon yellow
-        0x00ccff, // String 3 — electric cyan
-        0xff9d00, // String 4 — vivid orange
-        0x10e62c, // String 5 — bright lime
-        0xbc00ff, // String 6 — intense violet
-        0xff6bd5, // String 7 — hot pink (extended-range guitar)
-        0x6bffe6, // String 8 — aqua (extended-range guitar)
-    ];
+    // Selectable per-string color palettes (issue #10). Each palette has
+    // 8 entries to match MAX_RENDER_STRINGS so 6/7/8-string arrangements
+    // all index safely. Default is the original Rocksmith+ neon set; Neon
+    // pushes saturation harder; Pastel desaturates for long-session
+    // comfort. Per-panel selection lives in settings.html / localStorage.
+    const PALETTES = {
+        default: [
+            0xfc2d5d, 0xffe100, 0x00ccff, 0xff9d00,
+            0x10e62c, 0xbc00ff, 0xff6bd5, 0x6bffe6,
+        ],
+        neon: [
+            0xff1090, 0xfaff00, 0x00fff0, 0xff7700,
+            0x40ff40, 0xc040ff, 0xff40d0, 0x40ffd0,
+        ],
+        pastel: [
+            0xe89aa0, 0xefdf90, 0x9adfee, 0xefb898,
+            0xa6e0a8, 0xc4a6e0, 0xe0a6c8, 0xa6e0d8,
+        ],
+    };
+    const PALETTE_IDS = Object.keys(PALETTES);
+    // Default palette at module scope so out-of-IIFE consumers (e.g. the
+    // out-of-range warning's reference to "palette size") still have a
+    // canonical length to compare against.
+    const S_COL = PALETTES.default;
 
     const SCALE = 2.25;
     const K     = SCALE / 300;
@@ -270,7 +283,7 @@
         return _bgBandsCache;
     }
 
-    const BG_DEFAULTS = { style: 'particles', intensity: 0.5, reactive: true };
+    const BG_DEFAULTS = { style: 'particles', intensity: 0.5, reactive: true, palette: 'default' };
     const BG_STYLE_IDS = ['off', 'particles', 'silhouettes', 'lights', 'geometric'];
 
     function _bgPanelKey(canvas) {
@@ -307,6 +320,7 @@
             return BG_DEFAULTS.reactive;  // unknown / corrupted → default, matches settings.html coerceReactive
         }
         if (key === 'style') return BG_STYLE_IDS.includes(val) ? val : BG_DEFAULTS.style;
+        if (key === 'palette') return PALETTE_IDS.includes(val) ? val : BG_DEFAULTS.palette;
         return val;
     }
     function _bgWriteGlobal(key, val) {
@@ -334,6 +348,10 @@
     window.h3dBgSetStyle     = (v) => _bgWriteGlobal('style', v);
     window.h3dBgSetIntensity = (v) => _bgWriteGlobal('intensity', v);
     window.h3dBgSetReactive  = (v) => _bgWriteGlobal('reactive', !!v);
+    window.h3dBgSetPalette   = (v) => _bgWriteGlobal('palette', v);
+    // Back-compat alias for any caller that picked up the original
+    // (inconsistent) name during this PR's review window.
+    window.h3dSetPalette     = window.h3dBgSetPalette;
 
     // Procedural silhouette bitmap, drawn once and shared across panels.
     // The Canvas2D bitmap is module-level (cheap, CPU-only); each layer
@@ -522,8 +540,13 @@
                 // here, so no further clamp is needed.
                 const N = Math.floor(6 + 8 * settings.intensity);
                 const lights = [];
+                // Palette comes from the calling panel's settings so
+                // each splitscreen panel picks its own (issue #10).
+                // Falls back to the default palette if the caller
+                // doesn't supply one (e.g. an older code path).
+                const palette = settings.palette || PALETTES.default;
                 for (let i = 0; i < N; i++) {
-                    const color = S_COL[i % S_COL.length];
+                    const color = palette[i % palette.length];
                     // 30*K plane reads as a real stage glow at distance.
                     // Build-time opacity is overridden every frame in
                     // update() — the runtime formula is the source of
@@ -656,6 +679,11 @@
         // pass. bgState is the active style's per-panel state object.
         let bgGroup = null, bgStage = null, bgState = null;
         let bgStyleId = 'particles', bgIntensity = 0.5, bgReactive = true;
+        // Active palette for this panel (issue #10). Materials and per-
+        // frame color reads inside createFactory all consult this rather
+        // than the module-level S_COL, so a palette swap re-tints the
+        // panel live without touching module-level state.
+        let activePalette = PALETTES.default;
         let _bgListener = null;
         let _bgLastT = 0;  // ms timestamp for dt
 
@@ -1026,23 +1054,23 @@
             );
 
             // String materials: emissive so they glow when lit
-            mStr  = S_COL.map(c => new T.MeshStandardMaterial({
+            mStr  = activePalette.map(c => new T.MeshStandardMaterial({
                 color: c, emissive: c, emissiveIntensity: 0.002,
                 transparent: true, opacity: 0.4, roughness: 1,
             }));
-            mGlow = S_COL.map(c => new T.MeshLambertMaterial({
+            mGlow = activePalette.map(c => new T.MeshLambertMaterial({
                 color: 0xffffff, emissive: c, emissiveIntensity: 1.5,
             }));
-            mProj = S_COL.map(c => new T.MeshStandardMaterial({
+            mProj = activePalette.map(c => new T.MeshStandardMaterial({
                 color: c, emissive: c, emissiveIntensity: 0.002,
                 transparent: true, opacity: 0.15, roughness: 1,
             }));
-            mProjGlow = S_COL.map(c => new T.MeshLambertMaterial({
+            mProjGlow = activePalette.map(c => new T.MeshLambertMaterial({
                 color: 0xffffff, emissive: c, emissiveIntensity: 1.5,
                 transparent: true, opacity: 0.1,
             }));
             _laneTargetColor = new T.Color(0x4488ff);
-            mSus = S_COL.map(c => new T.MeshLambertMaterial({
+            mSus = activePalette.map(c => new T.MeshLambertMaterial({
                 color: c, transparent: true, opacity: 0.35,
             }));
             mWhiteOutline = new T.MeshLambertMaterial({ color: 0xffffff, emissive: 0xffffff, emissiveIntensity: 0.6 });
@@ -1051,13 +1079,13 @@
             mBeatQ = new T.LineBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.07 });
 
             // ── Projection meshes — one per string, own material clone each ──
-            projMeshArr = S_COL.map((_, s) => {
+            projMeshArr = activePalette.map((_, s) => {
                 const m = new T.Mesh(gNote, mProj[s].clone());
                 m.visible = false;
                 noteG.add(m);
                 return m;
             });
-            projGlowArr = S_COL.map((_, s) => {
+            projGlowArr = activePalette.map((_, s) => {
                 const m = new T.Mesh(gNote, mProjGlow[s].clone());
                 m.visible = false;
                 m.renderOrder = -1;
@@ -1141,6 +1169,25 @@
                     _bgLoadSettings();
                     return;
                 }
+                if (changedKey === 'palette') {
+                    // Palette change has three effects:
+                    //  1. _bgLoadSettings -> _applyPaletteToMaterials
+                    //     retints the per-instance shared materials
+                    //     (notes, glows, sustain trails, projection).
+                    //  2. buildBoard rebuilds the fretboard meshes
+                    //     (LineBasicMaterial lane lines + per-string
+                    //     BoxGeometry materials). These are created at
+                    //     build time with palette-baked colors and
+                    //     aren't reachable from _applyPaletteToMaterials.
+                    //  3. lights bg style bakes palette colors into
+                    //     sprite quads at build time, so it needs a
+                    //     full mesh rebuild — fire _bgRebuild when
+                    //     that style is active.
+                    _bgLoadSettings();
+                    if (fretG) buildBoard();
+                    if (bgStyleId === 'lights') _bgRebuild();
+                    return;
+                }
                 if (!changedKey || changedKey === 'style' || changedKey === 'intensity') {
                     _bgRebuild();
                 }
@@ -1155,6 +1202,49 @@
             bgStyleId   = _bgReadSetting(panelKey, 'style');
             bgIntensity = _bgReadSetting(panelKey, 'intensity');
             bgReactive  = _bgReadSetting(panelKey, 'reactive');
+            const newPaletteId = _bgReadSetting(panelKey, 'palette');
+            const newPalette = PALETTES[newPaletteId] || PALETTES.default;
+            if (newPalette !== activePalette) {
+                activePalette = newPalette;
+                _applyPaletteToMaterials();
+            }
+        }
+        // Live-swap palette by mutating existing materials in place.
+        // Three.js colors propagate to all sharing meshes on the next
+        // render — no rebuild, no GC. Glow materials (mGlow, mProjGlow)
+        // were authored with .color = white and the per-string color in
+        // .emissive only; we preserve that here so the glow look stays
+        // consistent before/after a palette swap rather than tinting
+        // the diffuse white. Lane lines and drop lines that read
+        // activePalette[s] per frame pick up automatically. Per-string
+        // fretboard materials built inside buildBoard() are independent
+        // and aren't reachable from here — buildBoard re-runs from the
+        // palette listener to regenerate them with the new colors.
+        //
+        // projMeshArr / projGlowArr meshes hold per-mesh CLONES of
+        // mProj / mProjGlow (each string needs its own opacity,
+        // overridden per-frame in drawNote), so updating mProj/mProjGlow
+        // alone wouldn't retint the projection ghosts. Walk those
+        // cloned materials too.
+        function _applyPaletteToMaterials() {
+            for (let s = 0; s < activePalette.length; s++) {
+                const c = activePalette[s];
+                if (mStr[s])      { mStr[s].color.setHex(c);  mStr[s].emissive.setHex(c); }
+                if (mGlow[s])       mGlow[s].emissive.setHex(c);
+                if (mSus[s])        mSus[s].color.setHex(c);
+                if (mProj[s])     { mProj[s].color.setHex(c); mProj[s].emissive.setHex(c); }
+                if (mProjGlow[s])   mProjGlow[s].emissive.setHex(c);
+                // Clones live on the projection meshes themselves.
+                const pm = projMeshArr  && projMeshArr[s];
+                if (pm && pm.material) {
+                    pm.material.color.setHex(c);
+                    pm.material.emissive?.setHex?.(c);
+                }
+                const pg = projGlowArr && projGlowArr[s];
+                if (pg && pg.material) {
+                    pg.material.emissive?.setHex?.(c);
+                }
+            }
         }
         function _bgMountStyle() {
             const style = BG_STYLES[bgStyleId] || BG_STYLES.off;
@@ -1165,7 +1255,7 @@
             const stage = new T.Group();
             let result = null;
             try {
-                result = style.build(stage, { intensity: bgIntensity }) || null;
+                result = style.build(stage, { intensity: bgIntensity, palette: activePalette }) || null;
             } catch (e) {
                 console.error('[3D-Hwy] bg style build failed', bgStyleId, e);
                 _bgDisposeGroupTree(stage);
@@ -1262,7 +1352,7 @@
             for (let s = 0; s < nStr; s++) {
                 const pts = [new T.Vector3(-2 * K, sY(s), 0), new T.Vector3(fretX(NFRETS) + 2 * K, sY(s), 0)];
                 const g   = new T.BufferGeometry().setFromPoints(pts);
-                fretG.add(new T.Line(g, new T.LineBasicMaterial({ color: S_COL[s], transparent: true, opacity: 0.15 })));
+                fretG.add(new T.Line(g, new T.LineBasicMaterial({ color: activePalette[s], transparent: true, opacity: 0.15 })));
             }
 
             // BoxGeometry strings — emissive glow driven by updateStringHighlights()
@@ -1271,7 +1361,7 @@
                 const g = new T.BoxGeometry(strLen, STR_THICK, STR_THICK);
                 // Each string gets its own material instance so emissiveIntensity is per-string
                 const mat = new T.MeshStandardMaterial({
-                    color: S_COL[s], emissive: S_COL[s],
+                    color: activePalette[s], emissive: activePalette[s],
                     emissiveIntensity: 0.002,
                     transparent: true, opacity: 0.4, roughness: 1,
                 });
@@ -1761,7 +1851,7 @@
                     const lineLen = lineTop - lineBot;
                     if (lineLen > 0.001) {
                         const dl = pDropLine.get();
-                        dl.material.color.set(S_COL[s]);
+                        dl.material.color.set(activePalette[s]);
                         dl.position.set(x, lineBot, noteZ);
                         dl.scale.set(1, lineLen, 1);
                     }

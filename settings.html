@@ -1,4 +1,24 @@
-<div role="group" aria-labelledby="h3d-bg-heading">
+<div role="group" aria-labelledby="h3d-palette-heading">
+    <h3 id="h3d-palette-heading" class="text-sm font-medium text-gray-400 mb-2">3D Highway — Palette</h3>
+    <p class="text-xs text-gray-500 mb-3">
+        Per-string color set used for note bodies, glows, sustain trails, and
+        lane lines. Settings here apply to all 3D Highway panels by default.
+    </p>
+
+    <!-- Palette -->
+    <div class="mt-3">
+        <label for="h3d-palette" class="text-xs font-medium text-gray-400 mb-1 block">Palette</label>
+        <select id="h3d-palette"
+            onchange="(window.h3dBgSetPalette || window.h3dSetPalette) && (window.h3dBgSetPalette || window.h3dSetPalette)(this.value)"
+            class="w-full bg-dark-700 border border-gray-800 rounded-lg px-3 py-2 text-xs text-gray-300 outline-none">
+            <option value="default" selected>Default (vibrant Rocksmith+)</option>
+            <option value="neon">Neon (saturated, electric)</option>
+            <option value="pastel">Pastel (soft, low contrast)</option>
+        </select>
+    </div>
+</div>
+
+<div role="group" aria-labelledby="h3d-bg-heading" class="mt-6">
     <h3 id="h3d-bg-heading" class="text-sm font-medium text-gray-400 mb-2">3D Highway — Background</h3>
     <p class="text-xs text-gray-500 mb-3">
         Subtle ambient animation in the distant fog area beyond the highway.
@@ -49,10 +69,12 @@
          no-selection / NaN state. -->
     <script>
         (function () {
-            const DEFAULTS = { style: 'particles', intensity: 0.5, reactive: true };
+            const DEFAULTS = { style: 'particles', intensity: 0.5, reactive: true, palette: 'default' };
             const VALID_STYLES = new Set(['off', 'particles', 'silhouettes', 'lights', 'geometric']);
+            const VALID_PALETTES = new Set(['default', 'neon', 'pastel']);
 
             function coerceStyle(v) { return VALID_STYLES.has(v) ? v : DEFAULTS.style; }
+            function coercePalette(v) { return VALID_PALETTES.has(v) ? v : DEFAULTS.palette; }
             function coerceIntensity(v) {
                 const n = parseFloat(v);
                 if (!Number.isFinite(n)) return DEFAULTS.intensity;
@@ -65,24 +87,28 @@
                 return DEFAULTS.reactive;
             }
 
-            let storedStyle = null, storedI = null, storedR = null;
+            let storedStyle = null, storedI = null, storedR = null, storedPalette = null;
             try {
                 storedStyle = localStorage.getItem('h3d_bg_style');
                 storedI = localStorage.getItem('h3d_bg_intensity');
                 storedR = localStorage.getItem('h3d_bg_reactive');
+                storedPalette = localStorage.getItem('h3d_bg_palette');
             } catch (_) { /* storage blocked */ }
 
             const style = coerceStyle(storedStyle);
             const intensity = coerceIntensity(storedI);
             const reactive = coerceReactive(storedR);
+            const palette = coercePalette(storedPalette);
 
             const sel = document.getElementById('h3d-bg-style');
             const sli = document.getElementById('h3d-bg-intensity');
             const lbl = document.getElementById('h3d-bg-intensity-label');
             const rea = document.getElementById('h3d-bg-reactive');
+            const pal = document.getElementById('h3d-palette');
             if (sel) sel.value = style;
             if (sli) sli.value = String(intensity);
             if (lbl) lbl.textContent = intensity.toFixed(2);
+            if (pal) pal.value = palette;
             if (rea) rea.checked = reactive;
         })();
     </script>
