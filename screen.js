@@ -383,16 +383,32 @@
                 for (let i = 0; i < N; i++) {
                     positions[i * 3]     = (Math.random() - 0.5) * 800 * K;
                     positions[i * 3 + 1] = (Math.random() - 0.4) * 80 * K;
-                    // Past note travel range. Notes go to ~ -AHEAD * TS =
-                    // -600 * K; spawning at -FOG_END * 0.95 ≈ -636 * K
-                    // and farther guarantees particles never paint over a
-                    // note even before the renderOrder belt-and-suspenders.
-                    positions[i * 3 + 2] = -FOG_END * (0.95 + Math.random() * 0.25);
+                    // Spawn within the visible fog range. Fog reaches
+                    // its far limit at FOG_END * 1.2 from the camera,
+                    // and cam.position.z is updated each frame in
+                    // camUpdate() (`dist * 0.75`, where dist tracks
+                    // aspectScale). Anything beyond that camera-relative
+                    // distance gets fully fogged out, so the cutoff in
+                    // world z is dynamic — the earlier "push past notes"
+                    // fix placed particles at -FOG_END * (0.95..1.20)
+                    // which sat past fog far at any camera z, making
+                    // them invisible. renderOrder = -1 on the bg stage
+                    // already keeps particles behind notes regardless
+                    // of z, so depth-based separation wasn't needed and
+                    // was actively breaking visibility.
+                    positions[i * 3 + 2] = -FOG_START - Math.random() * (FOG_END - FOG_START) * 0.85;
                 }
                 const geo = new T.BufferGeometry();
                 geo.setAttribute('position', new T.BufferAttribute(positions, 3));
                 const mat = new T.PointsMaterial({
-                    color: 0xa0c0ff, size: 1.5 * K, transparent: true, opacity: 0.5,
+                    // size 5*K (bumped from 1.5*K). At distance ~700*K
+                    // with sizeAttenuation the prior sprite shrank
+                    // below 2 pixels — practically invisible against
+                    // dark fog. 5*K reads as a small bright dot.
+                    // Build-time opacity is overridden every frame in
+                    // update() — the runtime formula is the source of
+                    // truth.
+                    color: 0xa0c0ff, size: 5 * K, transparent: true,
                     blending: T.AdditiveBlending, depthWrite: false, sizeAttenuation: true,
                 });
                 const points = new T.Points(geo, mat);
@@ -407,7 +423,11 @@
                     if (positions[i * 3] > 400 * K) positions[i * 3] -= 800 * K;
                 }
                 s.geo.attributes.position.needsUpdate = true;
-                s.mat.opacity = 0.4 + bands.treble * 0.4;
+                // Bumped opacity floor 0.4 → 0.55 + treble headroom
+                // 0.4 → 0.45 so particles read as visible specks even
+                // when bgReactive is false / treble≈0 (was effectively
+                // 0.4 floor, below noise floor against dark fog).
+                s.mat.opacity = 0.55 + bands.treble * 0.45;
             },
             teardown(s) {
                 if (!s) return;
@@ -419,11 +439,13 @@
         silhouettes: {
             build(scene, settings) {
                 const canvas = _bgEnsureSilhouetteCanvas();
-                // Notes travel out to ~ -AHEAD * TS = -600*K. Place all
-                // silhouette layers beyond that and well into the fog
-                // so they read as distant scenery, not as something in
-                // the play space.
-                const depths = [-FOG_END * 0.95, -FOG_END * 1.05, -FOG_END * 1.15];
+                // Inside the visible fog range. Fog far = FOG_END * 1.2
+                // from the camera, and cam.position.z is dynamic
+                // (camUpdate() sets `dist * 0.75`). renderOrder = -1
+                // on the bg stage handles "behind notes" regardless
+                // of z. Spread the three layers across the back half
+                // of the visible fog band for parallax separation.
+                const depths = [-FOG_END * 0.55, -FOG_END * 0.70, -FOG_END * 0.85];
                 const layers = [];
                 const allocated = [];
                 try {
@@ -502,18 +524,22 @@
                 const lights = [];
                 for (let i = 0; i < N; i++) {
                     const color = S_COL[i % S_COL.length];
-                    const geo = new T.PlaneGeometry(15 * K, 15 * K);
+                    // 30*K plane reads as a real stage glow at distance.
+                    // Build-time opacity is overridden every frame in
+                    // update() — the runtime formula is the source of
+                    // truth.
+                    const geo = new T.PlaneGeometry(30 * K, 30 * K);
                     const mat = new T.MeshBasicMaterial({
-                        color, transparent: true, opacity: 0.4,
+                        color, transparent: true,
                         blending: T.AdditiveBlending, depthWrite: false,
                     });
                     const mesh = new T.Mesh(geo, mat);
                     mesh.position.set(
                         (Math.random() - 0.5) * 600 * K,
                         (Math.random() - 0.3) * 80 * K,
-                        // Past note travel range — same rationale as
-                        // particles above.
-                        -FOG_END * (0.95 + Math.random() * 0.25)
+                        // Inside visible fog range; renderOrder = -1
+                        // keeps lights behind notes regardless of z.
+                        -FOG_START - Math.random() * (FOG_END - FOG_START) * 0.85
                     );
                     scene.add(mesh);
                     lights.push({ mesh, geo, mat, baseScale: 1 + Math.random() * 0.5, phase: Math.random() * Math.PI * 2 });
@@ -521,10 +547,15 @@
                 return { lights };
             },
             update(s, bands, dt, t) {
+                // Bumped opacity floor 0.35 → 0.55 + treble headroom
+                // 0.3 → 0.4 so lights read as visible stage glows at
+                // distance instead of faint specks (was effectively
+                // 0.35 floor since the build-time bump was overridden
+                // by this formula).
                 for (const L of s.lights) {
                     const pulse = 1 + bands.bass * 1.5 + Math.sin(t * 1.5 + L.phase) * 0.2;
                     L.mesh.scale.set(L.baseScale * pulse, L.baseScale * pulse, 1);
-                    L.mat.opacity = 0.35 + bands.treble * 0.3;
+                    L.mat.opacity = 0.55 + bands.treble * 0.4;
                 }
             },
             teardown(s) {
@@ -539,21 +570,24 @@
         geometric: {
             build(scene, settings) {
                 const meshes = [];
-                const op = 0.25 + 0.2 * settings.intensity;
+                // Bumped opacity floor (0.25 → 0.45) + ceiling so the
+                // wireframes read as real shapes instead of barely-
+                // there ghosts at low intensity.
+                const op = 0.45 + 0.25 * settings.intensity;
                 const ico = new T.Mesh(
-                    new T.IcosahedronGeometry(20 * K, 1),
+                    new T.IcosahedronGeometry(30 * K, 1),
                     new T.MeshBasicMaterial({ color: 0x6080c0, wireframe: true, transparent: true, opacity: op, depthWrite: false }),
                 );
-                // Past note travel range (~ -AHEAD * TS = -600*K) so the
-                // wireframes never paint over a far note.
-                ico.position.set(-100 * K, 30 * K, -FOG_END * 1.0);
+                // Inside visible fog range; renderOrder = -1 keeps
+                // wireframes behind notes regardless of z.
+                ico.position.set(-100 * K, 30 * K, -FOG_END * 0.65);
                 scene.add(ico);
                 meshes.push(ico);
                 const torus = new T.Mesh(
-                    new T.TorusGeometry(15 * K, 3 * K, 6, 12),
+                    new T.TorusGeometry(22 * K, 4 * K, 6, 12),
                     new T.MeshBasicMaterial({ color: 0xc06080, wireframe: true, transparent: true, opacity: op * 0.9, depthWrite: false }),
                 );
-                torus.position.set(120 * K, 20 * K, -FOG_END * 1.1);
+                torus.position.set(120 * K, 20 * K, -FOG_END * 0.75);
                 scene.add(torus);
                 meshes.push(torus);
                 return { meshes };
@@ -609,6 +643,13 @@
         let _lastHwW = 0, _lastHwH = 0;
         let mBeatM = null, mBeatQ = null;
         let txtCache = {};
+        // Cloned sprite materials cached on individual sprite instances
+        // (e.g. pmMark._pmMat). pLbl pool reuses sprites across labels,
+        // so when a sprite is later assigned a different material the
+        // _pmMat stays referenced on the sprite itself but isn't reached
+        // by the scene.traverse-based dispose. Track them here so
+        // teardown can dispose them explicitly.
+        const _ownedClonedMats = [];
 
         // Background animation state (issue #13). bgGroup is the parent
         // container for all bg meshes so teardown is one remove + dispose
@@ -1727,46 +1768,69 @@
                 }
 
                 // ── Technique labels ──────────────────────────────────────
-                let yo = y + NH * 0.8;
+                // Label scale = base × LBL_MULT × distFactor.
+                // distFactor compensates for perspective shrink so a
+                // label far from the camera (note approaching at dt≈AHEAD)
+                // doesn't collapse to a single dim pixel. LBL_MULT bumps
+                // every base scale uniformly. Issues #21-25 track proper
+                // visual upgrades (3D arrows, ribbons, glows); this is
+                // the cheap legibility win in the meantime.
+                //
+                // Offsets scale with sLbl too. The labels grow in world
+                // units to compensate for perspective; if the offsets
+                // didn't grow, stacked labels would overlap each other
+                // and the first label would overlap the note at the
+                // AHEAD edge. In screen space the offset stays roughly
+                // constant — labels appear anchored to the note even
+                // though the world-space distance grows.
+                const LBL_MULT  = 1.6;
+                const distFactor = 1 + Math.max(0, Math.min(1, dt / AHEAD)) * 1.5;
+                const sLbl = LBL_MULT * distFactor;
+                let yo = y + NH * 0.8 * sLbl;
                 if (n.bn > 0) {
                     const l = pLbl.get();
                     l.material = txtMat('↑' + bendText(n.bn), '#fff', true);
-                    l.scale.set(NH * 3.6, NH * 1.5, 1); l.position.set(x, yo, noteZ); yo += NH * 1.2;
+                    l.scale.set(NH * 3.6 * sLbl, NH * 1.5 * sLbl, 1); l.position.set(x, yo, noteZ); yo += NH * 1.2 * sLbl;
                 }
                 if (n.sl && n.sl !== -1) {
                     const l = pLbl.get();
                     l.material = txtMat(n.sl > n.f ? '↗' : '↘', '#fff', false);
-                    l.scale.set(NH * 1.6, NH * 1.6, 1); l.position.set(x + NW * 0.6, yo, noteZ);
+                    l.scale.set(NH * 1.6 * sLbl, NH * 1.6 * sLbl, 1); l.position.set(x + NW * 0.6 * sLbl, yo, noteZ);
                 }
                 if (n.ho || n.po || n.tp) {
                     const l = pLbl.get();
                     l.material = txtMat(n.ho ? 'H' : n.po ? 'P' : 'T', '#fff', false);
-                    l.scale.set(NH * 1.5, NH * 1.5, 1); l.position.set(x + NW * 0.6, yo, noteZ);
+                    l.scale.set(NH * 1.5 * sLbl, NH * 1.5 * sLbl, 1); l.position.set(x + NW * 0.6 * sLbl, yo, noteZ);
                 }
                 if (n.ac) {
                     const l = pLbl.get();
                     l.material = txtMat('>', '#fff', false);
-                    l.scale.set(NH * 1.6, NH * 1.6, 1); l.position.set(x, yo, noteZ); yo += NH * 1.2;
+                    l.scale.set(NH * 1.6 * sLbl, NH * 1.6 * sLbl, 1); l.position.set(x, yo, noteZ); yo += NH * 1.2 * sLbl;
                 }
                 if (n.tr) {
                     const l = pLbl.get();
                     l.material = txtMat('~~~', '#ff0', true);
-                    l.scale.set(NH * 3.0, NH * 1.2, 1); l.position.set(x, yo, noteZ);
+                    l.scale.set(NH * 3.0 * sLbl, NH * 1.2 * sLbl, 1); l.position.set(x, yo, noteZ);
                 }
                 if (n.pm) {
-                    // Palm mute: "X" overlay on the note body
+                    // Palm mute: "X" overlay on the note body — bumped
+                    // by LBL_MULT but not by distFactor since it's
+                    // anchored to the body not floating above.
                     const pmMark = pLbl.get();
-                    if (!pmMark._pmMat) pmMark._pmMat = txtMat('X', '#ffffff', false).clone();
+                    if (!pmMark._pmMat) {
+                        pmMark._pmMat = txtMat('X', '#ffffff', false).clone();
+                        _ownedClonedMats.push(pmMark._pmMat);
+                    }
                     pmMark.material = pmMark._pmMat;
                     pmMark.position.set(x, y + vibrato, noteZ + 0.1 * K);
-                    const pmScale = NH * 1.35;
+                    const pmScale = NH * 1.35 * LBL_MULT;
                     pmMark.scale.set(pmScale, pmScale, 1);
                     pmMark.material.opacity = hit ? 1.0 : 0.8;
                 }
                 if (n.hp) {
                     const l = pLbl.get();
                     l.material = txtMat('PH', '#ff0', true);
-                    l.scale.set(NH * 2.1, NH * 1.2, 1); l.position.set(x, y - NH * 1.1, noteZ);
+                    l.scale.set(NH * 2.1 * sLbl, NH * 1.2 * sLbl, 1); l.position.set(x, y - NH * 1.1 * sLbl, noteZ);
                 }
 
                 // ── Per-note fret connector label ─────────────────────────
@@ -1898,6 +1962,12 @@
             for (const m of mProjGlow) m?.dispose?.();
             mBeatM?.dispose?.(); mBeatQ?.dispose?.();
             for (const k in txtCache) { txtCache[k].map?.dispose(); txtCache[k].dispose(); }
+            // Dispose per-sprite cloned materials (e.g. pmMark._pmMat).
+            // These aren't reachable via scene.traverse once the sprite
+            // gets reassigned a different material, so the array tracks
+            // them at allocation time.
+            for (const m of _ownedClonedMats) m?.dispose?.();
+            _ownedClonedMats.length = 0;
             txtCache = {};
             if (ren) { ren.dispose(); ren = null; }
             scene = cam = noteG = beatG = lblG = fretG = null;
