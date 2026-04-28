@@ -2729,7 +2729,7 @@
                         arrow.renderOrder = 2;
                     } else {
                         const chevron = pTapChevron.get();
-                        const chevronScale = NH * 0.8 * sLbl; // Aumentado ligeramente para legibilidad
+                        const chevronScale = NH * 0.8 * sLbl; // Slightly increased for readability
                         chevron.position.set(x, y + vibrato, noteZ + 1.1 * K);
                         chevron.rotation.z = (isHarm ? Math.PI / 4 : 0);
                         chevron.scale.set(chevronScale, chevronScale, 1);
