@@ -1597,7 +1597,7 @@
             });
             gTechArrow.translate(0, -0.5, 0); // Center the geometry vertically
 
-            // Tap chevron (open V pointing downward) — line segments
+            // Tap chevron (open V pointing downward) — filled outline for extrusion into a solid mesh
 
             const chevronShape = new T.Shape();
 
