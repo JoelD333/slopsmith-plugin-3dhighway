@@ -87,6 +87,20 @@
     const FOCUS_D = 600 * K;
     const CAM_LERP_BASE = 0.02;
 
+    // Camera-X targeting (issue #34). The visible AHEAD = 3.0 s window is
+    // far too coarse for picking where the camera should sit — a single
+    // 17th-fret bend 2.5 s away yanks tgtX several frets even though the
+    // immediate playing area hasn't moved. These constants are bounds for
+    // a smoothing dial (0 = twitchy, 1 = calm); the runtime lerps between
+    // the pair using the user's `cameraSmoothing` setting.
+    const CAM_TGT_BEHIND   = 0.2;   // s behind hit line for X targeting
+    const CAM_TGT_AHEAD_T  = 2.0;   // s — twitchy: longer lookahead (more reactive)
+    const CAM_TGT_AHEAD_C  = 0.7;   // s — calm: shorter lookahead (ignore distant outliers)
+    const CAM_TGT_TAU_T    = 0.35;  // s — twitchy: short recency time-constant
+    const CAM_TGT_TAU_C    = 0.9;   // s — calm: longer time-constant (averages more)
+    const CAM_TGT_HYST_T   = 0.25;  // frets — twitchy: tiny dead zone
+    const CAM_TGT_HYST_C   = 2.5;   // frets — calm: wide dead zone
+
     const FOG_START = 200 * K;
     const FOG_END = 670 * K;
 
@@ -110,6 +124,11 @@
     const fretX = f => (f <= 0 ? 0 : SCALE - SCALE / Math.pow(2, f / 12));
     const fretMid = f => (f <= 0 ? -2 * K : (fretX(f - 1) + fretX(f)) / 2);
     const dZ = dt => -dt * TS;
+
+    // World-units-per-fret near mid-neck. Used by the camera-X hysteresis
+    // gate (issue #34) to convert a fret-equivalent dead zone into world
+    // units. Pure function of SCALE — hoist out of update()'s hot path.
+    const FRET_WIDTH_MID = fretX(7) - fretX(6);
 
     function computeBPM(beats, t) {
         if (!beats || beats.length < 2) return 120;
@@ -283,8 +302,8 @@
         return _bgBandsCache;
     }
 
-    const BG_DEFAULTS = { style: 'particles', intensity: 0.5, reactive: true, palette: 'default', showFretOnNote: false };
-    const BG_STYLE_IDS = ['off', 'particles', 'silhouettes', 'lights', 'geometric'];
+    const BG_DEFAULTS = { style: 'particles', intensity: 0.5, reactive: true, palette: 'default', showFretOnNote: false, cameraSmoothing: 0.5, customImageDataUrl: '', customImageName: '', customVideoName: '' };
+    const BG_STYLE_IDS = ['off', 'particles', 'silhouettes', 'lights', 'geometric', 'image', 'video'];
 
     function _bgPanelKey(canvas) {
         const ss = window.slopsmithSplitscreen;
@@ -322,9 +341,9 @@
         return fallback;
     }
     function _bgCoerce(key, val) {
-        if (key === 'intensity') {
+        if (key === 'intensity' || key === 'cameraSmoothing') {
             const n = parseFloat(val);
-            return Number.isFinite(n) ? Math.max(0, Math.min(1, n)) : BG_DEFAULTS.intensity;
+            return Number.isFinite(n) ? Math.max(0, Math.min(1, n)) : BG_DEFAULTS[key];
         }
         if (_BG_BOOL_KEYS.has(key)) return _bgCoerceBool(val, BG_DEFAULTS[key]);
         if (key === 'style') return BG_STYLE_IDS.includes(val) ? val : BG_DEFAULTS.style;
@@ -358,6 +377,31 @@
     window.h3dBgSetReactive = (v) => _bgWriteGlobal('reactive', !!v);
     window.h3dBgSetPalette = (v) => _bgWriteGlobal('palette', v);
     window.h3dBgSetShowFretOnNote = (v) => _bgWriteGlobal('showFretOnNote', !!v);
+    window.h3dBgSetCameraSmoothing = (v) => _bgWriteGlobal('cameraSmoothing', v);
+    // Custom image asset for the 'image' bg style (#19). Composite setter:
+    // writes both the data URL (the bytes that drive the texture) and the
+    // display filename, each emitting a change event. The listener
+    // rebuilds on customImageDataUrl change when the image style is
+    // active; customImageName is display-only and skips rebuild.
+    window.h3dBgSetCustomImage = (asset) => {
+        const a = asset || {};
+        _bgWriteGlobal('customImageDataUrl', a.dataUrl || '');
+        _bgWriteGlobal('customImageName', a.name || '');
+    };
+    window.h3dBgClearCustomImage = () => {
+        _bgWriteGlobal('customImageDataUrl', '');
+        _bgWriteGlobal('customImageName', '');
+    };
+    // Custom video asset for the 'video' bg style (#19 follow-up).
+    // Bytes live on disk under {config_dir}/plugin_uploads/highway_3d/
+    // and are served by routes.py — localStorage only stores the
+    // filename, which the renderer maps to the served URL. Single
+    // global slot; the file picker in settings.html POSTs to the
+    // upload route and then calls this setter with the response name.
+    window.h3dBgSetCustomVideo = (asset) => {
+        _bgWriteGlobal('customVideoName', (asset && asset.name) || '');
+    };
+    window.h3dBgClearCustomVideo = () => _bgWriteGlobal('customVideoName', '');
     // Back-compat alias for any caller that picked up the original
     // (inconsistent) name during this PR's review window.
     window.h3dSetPalette = window.h3dBgSetPalette;
@@ -391,6 +435,76 @@
         }
         _silCanvas = c;
         return c;
+    }
+
+    // Helpers shared by the asset-driven bg styles (image, video).
+    // Both render a "stage backdrop" plane that's full-bleed: sized
+    // each frame to fill the camera's view frustum at a fixed
+    // distance and positioned to track the camera (so the user's
+    // image/video reads as the entire visible BG, with highway and
+    // notes painting on top via renderOrder).
+    //
+    // Distance is chosen far enough back that no note ever lands
+    // beyond it; depthWrite=false on the plane material plus
+    // renderOrder=-1 means notes still paint on top regardless.
+    const BG_BACKDROP_DISTANCE = FOG_END * 0.95;
+
+    // Module-level scratch vector reused each frame to avoid GC
+    // churn from per-frame Vector3 allocation. Only valid for the
+    // duration of a single update() call.
+    const _bgBackdropTmp = (() => {
+        // Lazily created when T is available (T isn't bound at module
+        // parse time — initScene assigns it inside loadThree().then).
+        // Returning a getter that allocates on first read keeps the
+        // dependency timing clean.
+        let v = null;
+        return () => v || (v = new T.Vector3());
+    })();
+
+    // Frustum-fit a plane mesh: scale a unit PlaneGeometry to exactly
+    // fill the camera's view at the configured distance, then position
+    // it `distance` units in front of the camera and orient it so the
+    // texture faces the camera. Called whenever cam.aspect changes
+    // (resize) and to position-track the camera each frame.
+    function _bgFitBackdropPlane(state) {
+        const cam = state.cam;
+        const d = state.distance;
+        const halfFovRad = cam.fov * Math.PI / 360;
+        const visibleHeight = 2 * Math.tan(halfFovRad) * d;
+        const visibleWidth = visibleHeight * cam.aspect;
+        if (state.lastAspect !== cam.aspect ||
+            state.lastVisibleHeight !== visibleHeight) {
+            state.mesh.scale.set(visibleWidth, visibleHeight, 1);
+            state.lastAspect = cam.aspect;
+            state.lastVisibleHeight = visibleHeight;
+            // Aspect change shifts the cover-crop ratio; re-apply.
+            if (state.applyCoverCrop) state.applyCoverCrop();
+        }
+        // Track camera each frame: position = cam.position +
+        // cam.forward * distance, orient toward camera.
+        const fwd = cam.getWorldDirection(_bgBackdropTmp());
+        state.mesh.position.copy(cam.position).addScaledVector(fwd, d);
+        state.mesh.lookAt(cam.position);
+    }
+
+    // Cover-crop a texture to the plane aspect: the larger axis fills
+    // the plane (cropped if needed), centered. For wider-than-plane
+    // textures the X offset is left at the centered value but the
+    // image style's drift loop overwrites it per frame; the video
+    // style leaves it centered.
+    function _bgCoverCrop(tex, srcW, srcH, planeAspect) {
+        if (srcW <= 0 || srcH <= 0) return;
+        tex.repeat.set(1, 1);
+        tex.offset.set(0, 0);
+        const srcAspect = srcW / srcH;
+        if (srcAspect > planeAspect) {
+            tex.repeat.x = planeAspect / srcAspect;
+            tex.offset.x = (1 - tex.repeat.x) * 0.5;
+        } else {
+            tex.repeat.y = srcAspect / planeAspect;
+            tex.offset.y = (1 - tex.repeat.y) * 0.5;
+        }
+        tex.needsUpdate = true;
     }
 
     // Background-style registry. Each entry returns a per-panel state
@@ -642,6 +756,376 @@
                 }
             },
         },
+        // Custom image backdrop (#19). User uploads a JPG/PNG/WebP
+        // through settings.html; the bytes are persisted as a base64
+        // data URL in localStorage under h3d_bg_customImageDataUrl and
+        // passed in via settings.customImageDataUrl. Renders as a
+        // PlaneGeometry in the silhouette parallax band, "cover" cropped
+        // (via texture.repeat / offset) so non-matching aspects fill
+        // the plane without distortion. Slow horizontal drift on
+        // texture.offset.x for life. When no asset is uploaded, build
+        // returns null and the style is inert (settings.html disables
+        // the picker option in that case).
+        image: {
+            build(scene, settings) {
+                // Upfront validation: only accept the same raster image
+                // formats settings.html lets the user upload (jpeg /
+                // png / webp). Without this, a corrupt localStorage
+                // value (truncated base64, wrong scheme, plain string)
+                // OR an unsupported type (e.g. data:image/svg+xml)
+                // reaches TextureLoader and can fail asynchronously
+                // after the plane has been mounted — a silent black
+                // backdrop with no clear cause. Returning null here
+                // treats invalid bytes the same as "no asset uploaded":
+                // style is inert, the user can clear and re-upload
+                // from settings.html.
+                const dataUrl = (typeof settings.customImageDataUrl === 'string')
+                    ? settings.customImageDataUrl.trim() : '';
+                if (!/^data:image\/(jpeg|png|webp);/i.test(dataUrl)) return null;
+                // Renderer-side encoded-length cap. settings.html
+                // enforces the same limit on upload, but a manually
+                // edited localStorage value (or legacy data from
+                // before the upload guard existed) could still feed
+                // an arbitrarily large data URL into TextureLoader
+                // and burn memory / CPU during decode. Treat overlong
+                // values as "no asset" — style is inert, user can
+                // clear and re-upload from settings.
+                if (dataUrl.length > 2.5 * 1024 * 1024) return null;
+                // Renderer-side decompression-bomb caps. Mirror
+                // settings.html's upload-time guard so a manual
+                // localStorage edit (or legacy data from before that
+                // guard existed) can't sneak a 50000×50000 PNG past
+                // and OOM the GPU on texture upload.
+                const MAX_IMAGE_DIM = 4096;
+                const MAX_IMAGE_PIXELS = 16 * 1024 * 1024;
+                // Full-bleed backdrop: unit plane, scaled per frame in
+                // _bgFitBackdropPlane to fill the camera's view at
+                // BG_BACKDROP_DISTANCE. fog: false so the backdrop
+                // shows in full color; notes drawn on top still pick
+                // up atmospheric fog as before.
+                const state = {
+                    mesh: null, geo: null, mat: null, tex: null,
+                    drift: 0.5, intensity: settings.intensity, loaded: false,
+                    cam: settings.cam, distance: BG_BACKDROP_DISTANCE,
+                    lastAspect: 0, lastVisibleHeight: 0,
+                };
+                // Helper closure for cover-crop refresh — called both
+                // on async decode (initial) and from _bgFitBackdropPlane
+                // when the camera aspect changes (resize).
+                state.applyCoverCrop = function () {
+                    if (!state.tex || !state.tex.image) return;
+                    _bgCoverCrop(
+                        state.tex,
+                        state.tex.image.width  || 0,
+                        state.tex.image.height || 0,
+                        state.cam.aspect,
+                    );
+                };
+                const tex = new T.TextureLoader().load(
+                    dataUrl,
+                    (loaded) => {
+                        // Image dimensions are only known after async decode.
+                        const imgW = loaded.image?.width  || 0;
+                        const imgH = loaded.image?.height || 0;
+                        if (imgW > MAX_IMAGE_DIM || imgH > MAX_IMAGE_DIM || (imgW * imgH) > MAX_IMAGE_PIXELS) {
+                            // Bail before the texture gets uploaded to
+                            // the GPU (Three.js uploads on first render
+                            // of a visible mesh — hiding the mesh here
+                            // skips that). Disposing the texture too,
+                            // belt-and-suspenders, in case anything
+                            // else holds a reference.
+                            console.warn('[3D-Hwy] custom image dimensions too large to render', imgW + 'x' + imgH);
+                            if (state.mesh) state.mesh.visible = false;
+                            loaded.dispose();
+                            return;
+                        }
+                        state.applyCoverCrop();
+                        // Reset drift to the centered triangle-wave
+                        // phase now that repeat.x is final. Without
+                        // this reset, drift accumulated during the
+                        // async decode would phase-shift the initial
+                        // offset by a non-deterministic amount —
+                        // wider images would open at whatever crop
+                        // the elapsed-decode-time happened to land on.
+                        state.drift = 0.5;
+                        state.loaded = true;
+                    },
+                    undefined,
+                    // Async-failure path: the upfront regex catches the
+                    // common "corrupted/truncated bytes" case, but a
+                    // valid-looking data URL can still fail to decode
+                    // (e.g. wrong MIME / unsupported codec). Hide the
+                    // mesh so we don't paint a frozen blank plane on
+                    // top of fog, and log so the failure isn't silent.
+                    (err) => {
+                        console.error('[3D-Hwy] custom image decode failed', err);
+                        if (state.mesh) state.mesh.visible = false;
+                    },
+                );
+                tex.colorSpace = T.SRGBColorSpace;
+                // ClampToEdge on both axes — user uploads are non-
+                // power-of-two in general, and WebGL1 rejects RepeatWrapping
+                // on NPOT textures (renders black or emits GL errors). The
+                // drift logic below uses a triangle-wave so the offset
+                // stays inside [0, 1-repeat] and never needs wrap.
+                tex.wrapS = T.ClampToEdgeWrapping;
+                tex.wrapT = T.ClampToEdgeWrapping;
+                // User uploads aren't power-of-two in general; mipmaps
+                // are noisy for a single static backdrop and burn memory.
+                tex.generateMipmaps = false;
+                tex.minFilter = T.LinearFilter;
+                tex.magFilter = T.LinearFilter;
+                const geo = new T.PlaneGeometry(1, 1);
+                const mat = new T.MeshBasicMaterial({
+                    map: tex, transparent: false, depthWrite: false, fog: false,
+                });
+                const mesh = new T.Mesh(geo, mat);
+                scene.add(mesh);
+                state.mesh = mesh;
+                state.geo  = geo;
+                state.mat  = mat;
+                state.tex  = tex;
+                // Initial fit so the first frame is correctly sized
+                // and positioned, even if update() hasn't run yet.
+                _bgFitBackdropPlane(state);
+                return state;
+            },
+            update(s, bands, dt) {
+                if (!s) return;
+                // Track camera position / aspect every frame. The
+                // helper resizes the plane and refreshes cover-crop
+                // when aspect changes, and re-positions the plane to
+                // stay BG_BACKDROP_DISTANCE in front of the camera.
+                _bgFitBackdropPlane(s);
+                // Skip drift advance until the texture has finished
+                // decoding. Without this guard, drift accumulates
+                // during the async load while repeat.x is still 1
+                // (its default), and once the cover-crop applies the
+                // image opens at a phase-shifted offset whose value
+                // depends on how long the decode took — the
+                // "centered start" intent becomes non-deterministic.
+                if (!s.loaded) return;
+                // Triangle-wave ping-pong drift inside the cropped slack.
+                // ClampToEdge on wrapS means we cannot wrap across the
+                // texture boundary (would render edge pixels stretched);
+                // ping-pong oscillates the visible window between the
+                // image's left and right edges, which gives the same
+                // "alive" feel without the WebGL1 NPOT-Repeat hazard.
+                // Slack is the horizontal margin between the cropped
+                // window and the texture edges; for taller-than-plane
+                // images repeat.x stays 1, slack collapses to 0, and
+                // the offset stays at 0 — the image sits still, which
+                // is correct (it's already filling horizontally).
+                s.drift += dt * 0.02 * s.intensity;
+                const slack = Math.max(0, 1 - s.tex.repeat.x);
+                // Period of 2 drift units ≈ 100 s at intensity = 0.5;
+                // gentle, cinematic. cyc ∈ [0, 2), tri ∈ [0, 1] then back.
+                const cyc = ((s.drift % 2) + 2) % 2;
+                const tri = cyc < 1 ? cyc : 2 - cyc;
+                s.tex.offset.x = tri * slack;
+            },
+            teardown(s) {
+                if (!s) return;
+                s.mesh.parent && s.mesh.parent.remove(s.mesh);
+                s.geo.dispose();
+                s.mat.dispose();
+                // This style owns the texture lifecycle (per the comment
+                // at _bgDisposeGroupTree: tree dispose does NOT touch
+                // material.map textures).
+                s.tex.dispose();
+            },
+        },
+        // Custom video backdrop (#19 follow-up). User uploads a
+        // .mp4/.webm via settings.html; routes.py stores it on disk and
+        // serves a same-origin URL (avoids CORS taint on VideoTexture).
+        // localStorage holds only the filename — bytes live in
+        // {config_dir}/plugin_uploads/highway_3d/. Per-panel video
+        // element so each panel can mount/teardown independently;
+        // browsers cache the video bytes after first fetch so multi-
+        // panel splitscreen pays only the decoder cost, not the
+        // network or disk-read cost.
+        video: {
+            build(scene, settings) {
+                // Lowercase before validation so a manual localStorage
+                // edit like `current.MP4` doesn't pass a case-insensitive
+                // regex check and then 404 against the server, which
+                // only ever produces and serves lowercase
+                // current.<ext> (the upload route lowercases the
+                // extension; routes.py's GET pattern is case-sensitive).
+                const filename = (typeof settings.customVideoName === 'string')
+                    ? settings.customVideoName.trim().toLowerCase() : '';
+                // Strict pattern matches routes.py's deterministic
+                // single-slot naming. Any other shape (corrupt
+                // localStorage, future schema change) → style is
+                // inert, no <video> created, no orphan request to a
+                // 404 endpoint.
+                if (!/^current\.(mp4|webm)$/.test(filename)) return null;
+                const url = '/api/plugins/highway_3d/files/' + filename;
+
+                // Track partial allocations so a throw between any of
+                // them can clean up. _bgMountStyle's failure path
+                // disposes the stage tree but explicitly does NOT
+                // dispose textures (per the comment at
+                // _bgDisposeGroupTree), and the <video> element is
+                // parented to document.body — not the stage — so
+                // neither would be reached without an explicit catch.
+                let videoEl = null, tex = null, geo = null, mat = null, mesh = null;
+                try {
+                    // muted + playsInline + autoplay is the cross-
+                    // browser recipe that bypasses gesture requirements
+                    // (Chrome, Firefox, Safari desktop + mobile).
+                    // preload='auto' lets the first frame land before
+                    // play() is called. src is deliberately NOT set
+                    // yet — we want every piece of state (mesh, tex)
+                    // to exist before the browser can fire
+                    // loadedmetadata or error events on a cached
+                    // resource. The handlers close over state.tex /
+                    // state.mesh; setting src first would create a
+                    // window where a fast cache hit could fire an
+                    // event into half-initialized state.
+                    videoEl = document.createElement('video');
+                    // No crossOrigin attribute: the URL is same-origin
+                    // (/api/plugins/highway_3d/files/…), so VideoTexture
+                    // never sees a tainted canvas. Setting
+                    // `crossOrigin = "anonymous"` would also strip
+                    // cookies from the fetch, which would 401 against
+                    // any cookie-protected slopsmith deployment. If
+                    // this ever needs to fetch cross-origin, switch
+                    // to `use-credentials` AND have the server send
+                    // the matching CORS headers.
+                    videoEl.muted = true;
+                    videoEl.playsInline = true;
+                    videoEl.loop = true;
+                    videoEl.autoplay = true;
+                    videoEl.preload = 'auto';
+                    videoEl.style.display = 'none';
+                    document.body.appendChild(videoEl);
+
+                    // Build mesh + texture before registering listeners
+                    // and before setting src. By the time loadedmetadata
+                    // or error can fire, state.tex and state.mesh are
+                    // both populated.
+                    tex = new T.VideoTexture(videoEl);
+                    tex.colorSpace = T.SRGBColorSpace;
+                    tex.wrapS = T.ClampToEdgeWrapping;
+                    tex.wrapT = T.ClampToEdgeWrapping;
+                    tex.minFilter = T.LinearFilter;
+                    tex.magFilter = T.LinearFilter;
+                    tex.generateMipmaps = false;
+                    geo = new T.PlaneGeometry(1, 1);
+                    mat = new T.MeshBasicMaterial({
+                        map: tex, transparent: false, depthWrite: false, fog: false,
+                    });
+                    mesh = new T.Mesh(geo, mat);
+                    scene.add(mesh);
+
+                    // Full-bleed backdrop: scaled and positioned each
+                    // frame in update() via _bgFitBackdropPlane.
+                    // cam + distance + lastAspect / lastVisibleHeight
+                    // power that helper.
+                    const state = {
+                        videoEl, mesh, geo, mat, tex,
+                        cam: settings.cam, distance: BG_BACKDROP_DISTANCE,
+                        lastAspect: 0, lastVisibleHeight: 0,
+                    };
+                    state.applyCoverCrop = function () {
+                        if (!state.videoEl) return;
+                        _bgCoverCrop(
+                            state.tex,
+                            state.videoEl.videoWidth  || 0,
+                            state.videoEl.videoHeight || 0,
+                            state.cam.aspect,
+                        );
+                    };
+
+                    // Cover-crop math runs on loadedmetadata since
+                    // video dimensions aren't known until then.
+                    // _bgFitBackdropPlane will also re-apply when the
+                    // camera aspect changes.
+                    videoEl.addEventListener('loadedmetadata', () => {
+                        state.applyCoverCrop();
+                    });
+                    videoEl.addEventListener('error', () => {
+                        // Fired for: codec unsupported, 404 from
+                        // server, truncated file, etc. Hide the mesh
+                        // so we don't paint a frozen blank plane on
+                        // top of fog.
+                        console.error('[3D-Hwy] custom video load failed', videoEl.error);
+                        state.mesh.visible = false;
+                    });
+
+                    // Set src last — this is what triggers the async
+                    // load. With handlers and state in place, any
+                    // synchronous-feeling event from a cached resource
+                    // is still safely received and handled.
+                    videoEl.src = url;
+
+                    // play() can reject for transient reasons (tab
+                    // backgrounded at mount time, low-power mode,
+                    // brief autoplay-policy timing window) even with
+                    // muted + autoplay set — but the browser retries
+                    // on its own once conditions improve (visibility
+                    // change, foregrounding, gesture). Real load /
+                    // codec failures come through the `error` event
+                    // we registered above and DO hide the mesh. So
+                    // just log here and leave the mesh visible; the
+                    // next ready frame will paint.
+                    videoEl.play().catch((err) => {
+                        console.warn('[3D-Hwy] custom video play() rejected (will retry on visibility/gesture)', err);
+                    });
+                    // Initial fit so the first frame is correctly
+                    // sized and positioned even before update() runs.
+                    _bgFitBackdropPlane(state);
+                    return state;
+                } catch (err) {
+                    // Best-effort cleanup of whatever was allocated
+                    // before the throw. Each step is independently
+                    // guarded so a secondary failure (e.g. dispose
+                    // throwing on an already-disposed object) can't
+                    // mask the original error.
+                    try {
+                        if (videoEl) {
+                            videoEl.pause();
+                            videoEl.removeAttribute('src');
+                            videoEl.load();
+                            if (videoEl.parentNode) videoEl.parentNode.removeChild(videoEl);
+                        }
+                    } catch (_) { /* ignore */ }
+                    try { if (mesh && mesh.parent) mesh.parent.remove(mesh); } catch (_) { /* ignore */ }
+                    try { if (geo) geo.dispose(); } catch (_) { /* ignore */ }
+                    try { if (mat) mat.dispose(); } catch (_) { /* ignore */ }
+                    try { if (tex) tex.dispose(); } catch (_) { /* ignore */ }
+                    throw err;
+                }
+            },
+            update(s) {
+                if (!s) return;
+                // VideoTexture auto-updates from the playing element —
+                // Three.js samples the current frame each render. No
+                // per-frame texture mutation here. Drift on offset.x
+                // is intentionally omitted: the video's own motion is
+                // the "life", drifting the crop on top would feel
+                // busy and compete with playback. The only per-frame
+                // work is keeping the plane camera-locked and resized
+                // when aspect changes (handled inside the helper).
+                _bgFitBackdropPlane(s);
+            },
+            teardown(s) {
+                if (!s) return;
+                if (s.videoEl) {
+                    try { s.videoEl.pause(); } catch (_) {}
+                    s.videoEl.removeAttribute('src');
+                    // load() with no src tells the browser to release
+                    // any decoder/buffer state for this element.
+                    try { s.videoEl.load(); } catch (_) {}
+                    if (s.videoEl.parentNode) s.videoEl.parentNode.removeChild(s.videoEl);
+                }
+                if (s.mesh) s.mesh.parent && s.mesh.parent.remove(s.mesh);
+                if (s.geo) s.geo.dispose();
+                if (s.mat) s.mat.dispose();
+                if (s.tex) s.tex.dispose();
+            },
+        },
     };
 
     /* ======================================================================
@@ -702,6 +1186,21 @@
         // by default — opt-in setting for players who like the at-a-
         // glance fret cue.
         let showFretOnNote = false;
+        // Camera-X smoothing dial (issue #34). 0 = twitchy (track every
+        // upcoming fret), 1 = calm (ignore small intra-cluster shifts).
+        // Cached here and refreshed via the bg listener to avoid a
+        // per-frame localStorage hit inside update().
+        let cameraSmoothing = 0.5;
+        // Custom image asset (issue #19). Data URL is the bytes that
+        // drive the 'image' bg style's texture; name is display-only
+        // metadata that settings.html shows next to the file picker.
+        let bgCustomImageDataUrl = '';
+        let bgCustomImageName = '';
+        // Custom video asset (issue #19 follow-up). Stores the
+        // server-side filename only; bytes live on disk via routes.py.
+        // The renderer composes the served URL from this filename in
+        // BG_STYLES.video.build.
+        let bgCustomVideoName = '';
         let _bgListener = null;
         let _bgLastT = 0;  // ms timestamp for dt
 
@@ -1261,11 +1760,12 @@
             scene.add(bgGroup);
             _bgMountStyle();
             _bgListener = (changedKey) => {
-                if (changedKey === 'reactive' || changedKey === 'showFretOnNote') {
+                if (changedKey === 'reactive' || changedKey === 'showFretOnNote' || changedKey === 'cameraSmoothing') {
                     // Reactive flag flips don't need a mesh rebuild —
                     // just refresh the per-instance flag for the next
                     // frame to consult. Same shape for showFretOnNote
-                    // (#12), which is read per-frame in drawNote.
+                    // (#12) and cameraSmoothing (#34), both read per-
+                    // frame in update().
                     _bgLoadSettings();
                     return;
                 }
@@ -1288,7 +1788,45 @@
                     if (bgStyleId === 'lights') _bgRebuild();
                     return;
                 }
-                if (!changedKey || changedKey === 'style' || changedKey === 'intensity') {
+                if (changedKey === 'customImageDataUrl') {
+                    // Asset bytes changed. Rebuild only when the image
+                    // style is active — otherwise the new bytes will
+                    // pick up next time the user picks `image`.
+                    _bgLoadSettings();
+                    if (bgStyleId === 'image') _bgRebuild();
+                    return;
+                }
+                if (changedKey === 'customImageName') {
+                    // Display-only metadata; no mesh rebuild.
+                    _bgLoadSettings();
+                    return;
+                }
+                if (changedKey === 'customVideoName') {
+                    // Filename change → new <video> source. Rebuild
+                    // only when the video style is currently active;
+                    // otherwise the new bytes pick up next time the
+                    // user picks `video`.
+                    _bgLoadSettings();
+                    if (bgStyleId === 'video') _bgRebuild();
+                    return;
+                }
+                if (changedKey === 'intensity') {
+                    _bgLoadSettings();
+                    // Image style reads s.intensity per frame inside
+                    // update() to scale the drift speed, so a live
+                    // mutation is enough — no need to tear down and
+                    // re-decode the texture for every slider change.
+                    // The procedural styles bake intensity into mesh
+                    // count, opacity, and size at build time, so they
+                    // still need a full rebuild.
+                    if (bgStyleId === 'image' && bgState) {
+                        bgState.intensity = bgIntensity;
+                        return;
+                    }
+                    _bgRebuild();
+                    return;
+                }
+                if (!changedKey || changedKey === 'style') {
                     _bgRebuild();
                 }
             };
@@ -1350,6 +1888,45 @@
                 _applyPaletteToMaterials();
             }
             showFretOnNote = _bgReadSetting(panelKey, 'showFretOnNote');
+            cameraSmoothing = _bgReadSetting(panelKey, 'cameraSmoothing');
+            // Custom image asset is a single GLOBAL slot — bytes are
+            // shared across panels (per-panel choice is which style
+            // each panel renders, not which asset). Reading via
+            // _bgReadSetting would let a stray h3d_bg_panel<idx>_*
+            // override silently re-introduce the per-panel asset
+            // duplication this design deliberately avoids (and
+            // h3dBgClearCustomImage wouldn't reach those overrides).
+            // Read globals directly instead.
+            //
+            // Precedence: in-memory fallback BEFORE localStorage. The
+            // setter always populates _bgMemFallback (even when the
+            // localStorage write fails on quota), so the fallback
+            // holds the most-recent staged value. Reading localStorage
+            // first would mean a failed write leaves the renderer
+            // pointed at the previous asset while settings.html shows
+            // a "session-only" warning claiming the new bytes are in
+            // effect — UI and renderer would silently disagree.
+            const memDataUrl = _bgMemFallback.customImageDataUrl;
+            const memName    = _bgMemFallback.customImageName;
+            try {
+                const gDataUrl = (memDataUrl !== undefined) ? memDataUrl : localStorage.getItem('h3d_bg_customImageDataUrl');
+                const gName    = (memName    !== undefined) ? memName    : localStorage.getItem('h3d_bg_customImageName');
+                bgCustomImageDataUrl = (gDataUrl != null) ? gDataUrl : BG_DEFAULTS.customImageDataUrl;
+                bgCustomImageName    = (gName    != null) ? gName    : BG_DEFAULTS.customImageName;
+            } catch (_) {
+                bgCustomImageDataUrl = (memDataUrl !== undefined) ? memDataUrl : BG_DEFAULTS.customImageDataUrl;
+                bgCustomImageName    = (memName    !== undefined) ? memName    : BG_DEFAULTS.customImageName;
+            }
+            // Custom video filename: also a single global slot, same
+            // mem-first precedence as the image keys (a quota-failed
+            // setItem leaves _bgMemFallback ahead of localStorage).
+            const memVideoName = _bgMemFallback.customVideoName;
+            try {
+                const gVideoName = (memVideoName !== undefined) ? memVideoName : localStorage.getItem('h3d_bg_customVideoName');
+                bgCustomVideoName = (gVideoName != null) ? gVideoName : BG_DEFAULTS.customVideoName;
+            } catch (_) {
+                bgCustomVideoName = (memVideoName !== undefined) ? memVideoName : BG_DEFAULTS.customVideoName;
+            }
         }
         // Live-swap palette by mutating existing materials in place.
         // Three.js colors propagate to all sharing meshes on the next
@@ -1397,7 +1974,13 @@
             const stage = new T.Group();
             let result = null;
             try {
-                result = style.build(stage, { intensity: bgIntensity, palette: activePalette }) || null;
+                result = style.build(stage, {
+                    intensity: bgIntensity,
+                    palette: activePalette,
+                    customImageDataUrl: bgCustomImageDataUrl,
+                    customVideoName: bgCustomVideoName,
+                    cam: cam,
+                }) || null;
             } catch (e) {
                 console.error('[3D-Hwy] bg style build failed', bgStyleId, e);
                 _bgDisposeGroupTree(stage);
@@ -1685,8 +2268,19 @@
                 if (now - fretLastActiveTime[f] < FRET_COOLDOWN) activeFrets.add(f);
             }
 
-            // Camera targeting
+            // Camera targeting. fMin/fMax over the full visible window
+            // continue to drive tgtDist (zoom-out for wide chords). tgtX
+            // is driven separately by a recency-weighted centroid in
+            // world units over a narrower window (issue #34) so distant
+            // outliers don't yank the camera left/right.
             let fMin = 99, fMax = 0, got = false;
+            const cs        = cameraSmoothing;
+            const camAhead  = CAM_TGT_AHEAD_T + (CAM_TGT_AHEAD_C - CAM_TGT_AHEAD_T) * cs;
+            const camTau    = CAM_TGT_TAU_T   + (CAM_TGT_TAU_C   - CAM_TGT_TAU_T)   * cs;
+            const camHystF  = CAM_TGT_HYST_T  + (CAM_TGT_HYST_C  - CAM_TGT_HYST_T)  * cs;
+            const camT0     = now - CAM_TGT_BEHIND;
+            const camT1     = now + camAhead;
+            let camWX = 0, camWSum = 0;
 
             // ── Single notes ──────────────────────────────────────────────
             const lastFretForString = new Array(nStr).fill(undefined);
@@ -1704,6 +2298,11 @@
                     drawNote(n, now, undefined, isNext, skipLabel, false);
                     lastFretForString[n.s] = n.f;
                     if (n.f > 0 && n.t <= t1) { fMin = Math.min(fMin, n.f); fMax = Math.max(fMax, n.f); got = true; }
+                    if (n.f > 0 && n.t >= camT0 && n.t <= camT1) {
+                        const w = Math.exp(-Math.max(0, n.t - now) / camTau);
+                        camWX   += fretMid(n.f) * w;
+                        camWSum += w;
+                    }
                 }
             }
 
@@ -1749,12 +2348,15 @@
                     }
                     if (fretted > 0) chordCX = (cxL + cxR) / 2;
 
+                    const chWindowed = ch.t >= camT0 && ch.t <= camT1;
+                    const chW        = chWindowed ? Math.exp(-Math.max(0, ch.t - now) / camTau) : 0;
                     for (const cn of chordNotes) {
                         const isNext = nextNoteByString[cn.s] && Math.abs(nextNoteByString[cn.s].t - ch.t) < 0.001;
                         const skipLabel = lastFretForString[cn.s] === cn.f;
                         drawNote({ ...cn, t: ch.t, sus: cn.sus || 0 }, now, cn.f === 0 ? chordCX : undefined, isNext, skipLabel, isRepeat, 0.55);
                         lastFretForString[cn.s] = cn.f;
                         if (cn.f > 0 && ch.t <= t1) { fMin = Math.min(fMin, cn.f); fMax = Math.max(fMax, cn.f); got = true; }
+                        if (cn.f > 0 && chWindowed) { camWX += fretMid(cn.f) * chW; camWSum += chW; }
                     }
 
                     // Chord frame-box
@@ -1858,6 +2460,24 @@
             }
 
             // ── Dynamic fret number row (heat-coloured) ───────────────────
+            // Two-part fix for issue #35:
+            //  1. renderOrder = 1000 forces these sprites to the end of
+            //     the transparent queue so they always paint on top of
+            //     notes, sustain trails, lane plane, etc. depthTest is
+            //     already disabled by txtMat(), but `depthTest: false`
+            //     only exempts the sprite from depth comparison — it
+            //     doesn't pin draw order. Without an explicit
+            //     renderOrder, a note rendered after the label in the
+            //     transparent pass would still overdraw it. Match the
+            //     pattern already used for lane and dividers.
+            //  2. Y-offset bumped from S_GAP * 0.6 to S_GAP * 1.4 so the
+            //     label band sits clearly below the lowest string in
+            //     screen space, even at the largest active scale
+            //     (intensity-driven, up to ~5.7 * K vertical extent).
+            //     This buys a real visual gap between notes-on-the-
+            //     lowest-string and the row, on top of the renderOrder
+            //     guarantee — labels never share screen with what's
+            //     happening on the playing strings just above them.
             {
                 const yBottom = Math.min(sY(0), sY(nStr - 1));
                 for (let f = 1; f <= NFRETS; f++) {
@@ -1869,6 +2489,7 @@
                     lb.material.opacity = 0.35 + intensity * 0.65;
                     const scale = 3.5 + intensity * 2.2;
                     lb.scale.set(scale * K, scale * K, 1);
+                    lb.renderOrder = 1000;
                 }
             }
 
@@ -1899,9 +2520,17 @@
             }
 
             // ── Camera target ─────────────────────────────────────────────
+            // tgtDist still tracks the visible-window fret span so wide
+            // chords pull the camera back; tgtX uses the narrowed,
+            // recency-weighted centroid with a hysteresis dead zone so
+            // small intra-cluster shifts don't produce visible motion.
             if (got) {
-                tgtX = fretMid(Math.round((fMin + fMax) / 2));
                 tgtDist = (65 + Math.max(fMax - fMin, 4) * 3) * K;
+            }
+            if (camWSum > 0) {
+                const candidateX = camWX / camWSum;
+                const hystWorld  = camHystF * FRET_WIDTH_MID;
+                if (Math.abs(candidateX - tgtX) > hystWorld) tgtX = candidateX;
             }
 
             // ── Chord diagram: track most recently hit chord in linger window ─
