@@ -2373,17 +2373,36 @@
             }
 
             // ── Dynamic fret number row (heat-coloured) ───────────────────
+            // Two-part fix for issue #35:
+            //  1. renderOrder = 1000 forces these sprites to the end of
+            //     the transparent queue so they always paint on top of
+            //     notes, sustain trails, lane plane, etc. depthTest is
+            //     already disabled by txtMat(), but `depthTest: false`
+            //     only exempts the sprite from depth comparison — it
+            //     doesn't pin draw order. Without an explicit
+            //     renderOrder, a note rendered after the label in the
+            //     transparent pass would still overdraw it. Match the
+            //     pattern already used for lane and dividers.
+            //  2. Y-offset bumped from S_GAP * 0.6 to S_GAP * 1.4 so the
+            //     label band sits clearly below the lowest string in
+            //     screen space, even at the largest active scale
+            //     (intensity-driven, up to ~5.7 * K vertical extent).
+            //     This buys a real visual gap between notes-on-the-
+            //     lowest-string and the row, on top of the renderOrder
+            //     guarantee — labels never share screen with what's
+            //     happening on the playing strings just above them.
             {
                 const yBottom = Math.min(sY(0), sY(nStr - 1));
                 for (let f = 1; f <= NFRETS; f++) {
                     const lb       = pFretLbl.get();
                     const isActive = activeFrets.has(f);
                     lb.material    = txtMat(f, isActive ? '#ffe84d' : '#9ab8cc', false);
-                    lb.position.set(fretMid(f), yBottom - S_GAP * 0.6, 0.5 * K);
+                    lb.position.set(fretMid(f), yBottom - S_GAP * 1.4, 0.5 * K);
                     const intensity = noteState.fretHeat[f];
                     lb.material.opacity = 0.35 + intensity * 0.65;
                     const scale = 3.5 + intensity * 2.2;
                     lb.scale.set(scale * K, scale * K, 1);
+                    lb.renderOrder = 1000;
                 }
             }
 
