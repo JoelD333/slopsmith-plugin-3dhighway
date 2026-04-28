@@ -87,6 +87,20 @@
     const FOCUS_D       = 600 * K;
     const CAM_LERP_BASE = 0.02;
 
+    // Camera-X targeting (issue #34). The visible AHEAD = 3.0 s window is
+    // far too coarse for picking where the camera should sit — a single
+    // 17th-fret bend 2.5 s away yanks tgtX several frets even though the
+    // immediate playing area hasn't moved. These constants are bounds for
+    // a smoothing dial (0 = twitchy, 1 = calm); the runtime lerps between
+    // the pair using the user's `cameraSmoothing` setting.
+    const CAM_TGT_BEHIND   = 0.2;   // s behind hit line for X targeting
+    const CAM_TGT_AHEAD_T  = 2.0;   // s — twitchy: longer lookahead (more reactive)
+    const CAM_TGT_AHEAD_C  = 0.7;   // s — calm: shorter lookahead (ignore distant outliers)
+    const CAM_TGT_TAU_T    = 0.35;  // s — twitchy: short recency time-constant
+    const CAM_TGT_TAU_C    = 0.9;   // s — calm: longer time-constant (averages more)
+    const CAM_TGT_HYST_T   = 0.25;  // frets — twitchy: tiny dead zone
+    const CAM_TGT_HYST_C   = 2.5;   // frets — calm: wide dead zone
+
     const FOG_START = 200 * K;
     const FOG_END   = 670 * K;
 
@@ -110,6 +124,11 @@
     const fretX   = f => (f <= 0 ? 0 : SCALE - SCALE / Math.pow(2, f / 12));
     const fretMid = f => (f <= 0 ? -2 * K : (fretX(f - 1) + fretX(f)) / 2);
     const dZ      = dt => -dt * TS;
+
+    // World-units-per-fret near mid-neck. Used by the camera-X hysteresis
+    // gate (issue #34) to convert a fret-equivalent dead zone into world
+    // units. Pure function of SCALE — hoist out of update()'s hot path.
+    const FRET_WIDTH_MID = fretX(7) - fretX(6);
 
     function computeBPM(beats, t) {
         if (!beats || beats.length < 2) return 120;
@@ -283,7 +302,7 @@
         return _bgBandsCache;
     }
 
-    const BG_DEFAULTS = { style: 'particles', intensity: 0.5, reactive: true, palette: 'default', showFretOnNote: false, customImageDataUrl: '', customImageName: '', customVideoName: '' };
+    const BG_DEFAULTS = { style: 'particles', intensity: 0.5, reactive: true, palette: 'default', showFretOnNote: false, cameraSmoothing: 0.5, customImageDataUrl: '', customImageName: '', customVideoName: '' };
     const BG_STYLE_IDS = ['off', 'particles', 'silhouettes', 'lights', 'geometric', 'image', 'video'];
 
     function _bgPanelKey(canvas) {
@@ -339,9 +358,9 @@
         return fallback;
     }
     function _bgCoerce(key, val) {
-        if (key === 'intensity') {
+        if (key === 'intensity' || key === 'cameraSmoothing') {
             const n = parseFloat(val);
-            return Number.isFinite(n) ? Math.max(0, Math.min(1, n)) : BG_DEFAULTS.intensity;
+            return Number.isFinite(n) ? Math.max(0, Math.min(1, n)) : BG_DEFAULTS[key];
         }
         if (_BG_BOOL_KEYS.has(key)) return _bgCoerceBool(val, BG_DEFAULTS[key]);
         if (key === 'style') return BG_STYLE_IDS.includes(val) ? val : BG_DEFAULTS.style;
@@ -375,6 +394,7 @@
     window.h3dBgSetReactive  = (v) => _bgWriteGlobal('reactive', !!v);
     window.h3dBgSetPalette   = (v) => _bgWriteGlobal('palette', v);
     window.h3dBgSetShowFretOnNote = (v) => _bgWriteGlobal('showFretOnNote', !!v);
+    window.h3dBgSetCameraSmoothing = (v) => _bgWriteGlobal('cameraSmoothing', v);
     // Custom image asset for the 'image' bg style (#19). Composite setter:
     // writes both the data URL (the bytes that drive the texture) and the
     // display filename, each emitting a change event. The listener
@@ -1183,6 +1203,11 @@
         // by default — opt-in setting for players who like the at-a-
         // glance fret cue.
         let showFretOnNote = false;
+        // Camera-X smoothing dial (issue #34). 0 = twitchy (track every
+        // upcoming fret), 1 = calm (ignore small intra-cluster shifts).
+        // Cached here and refreshed via the bg listener to avoid a
+        // per-frame localStorage hit inside update().
+        let cameraSmoothing = 0.5;
         // Custom image asset (issue #19). Data URL is the bytes that
         // drive the 'image' bg style's texture; name is display-only
         // metadata that settings.html shows next to the file picker.
@@ -1694,11 +1719,12 @@
             scene.add(bgGroup);
             _bgMountStyle();
             _bgListener = (changedKey) => {
-                if (changedKey === 'reactive' || changedKey === 'showFretOnNote') {
+                if (changedKey === 'reactive' || changedKey === 'showFretOnNote' || changedKey === 'cameraSmoothing') {
                     // Reactive flag flips don't need a mesh rebuild —
                     // just refresh the per-instance flag for the next
                     // frame to consult. Same shape for showFretOnNote
-                    // (#12), which is read per-frame in drawNote.
+                    // (#12) and cameraSmoothing (#34), both read per-
+                    // frame in update().
                     _bgLoadSettings();
                     return;
                 }
@@ -1821,6 +1847,7 @@
                 _applyPaletteToMaterials();
             }
             showFretOnNote = _bgReadSetting(panelKey, 'showFretOnNote');
+            cameraSmoothing = _bgReadSetting(panelKey, 'cameraSmoothing');
             // Custom image asset is a single GLOBAL slot — bytes are
             // shared across panels (per-panel choice is which style
             // each panel renders, not which asset). Reading via
@@ -2200,8 +2227,19 @@
                 if (now - fretLastActiveTime[f] < FRET_COOLDOWN) activeFrets.add(f);
             }
 
-            // Camera targeting
+            // Camera targeting. fMin/fMax over the full visible window
+            // continue to drive tgtDist (zoom-out for wide chords). tgtX
+            // is driven separately by a recency-weighted centroid in
+            // world units over a narrower window (issue #34) so distant
+            // outliers don't yank the camera left/right.
             let fMin = 99, fMax = 0, got = false;
+            const cs        = cameraSmoothing;
+            const camAhead  = CAM_TGT_AHEAD_T + (CAM_TGT_AHEAD_C - CAM_TGT_AHEAD_T) * cs;
+            const camTau    = CAM_TGT_TAU_T   + (CAM_TGT_TAU_C   - CAM_TGT_TAU_T)   * cs;
+            const camHystF  = CAM_TGT_HYST_T  + (CAM_TGT_HYST_C  - CAM_TGT_HYST_T)  * cs;
+            const camT0     = now - CAM_TGT_BEHIND;
+            const camT1     = now + camAhead;
+            let camWX = 0, camWSum = 0;
 
             // ── Single notes ──────────────────────────────────────────────
             const lastFretForString = new Array(nStr).fill(undefined);
@@ -2219,6 +2257,11 @@
                     drawNote(n, now, undefined, isNext, skipLabel, false);
                     lastFretForString[n.s] = n.f;
                     if (n.f > 0 && n.t <= t1) { fMin = Math.min(fMin, n.f); fMax = Math.max(fMax, n.f); got = true; }
+                    if (n.f > 0 && n.t >= camT0 && n.t <= camT1) {
+                        const w = Math.exp(-Math.max(0, n.t - now) / camTau);
+                        camWX   += fretMid(n.f) * w;
+                        camWSum += w;
+                    }
                 }
             }
 
@@ -2264,12 +2307,15 @@
                     }
                     if (fretted > 0) chordCX = (cxL + cxR) / 2;
 
+                    const chWindowed = ch.t >= camT0 && ch.t <= camT1;
+                    const chW        = chWindowed ? Math.exp(-Math.max(0, ch.t - now) / camTau) : 0;
                     for (const cn of chordNotes) {
                         const isNext    = nextNoteByString[cn.s] && Math.abs(nextNoteByString[cn.s].t - ch.t) < 0.001;
                         const skipLabel = lastFretForString[cn.s] === cn.f;
                         drawNote({ ...cn, t: ch.t, sus: cn.sus || 0 }, now, cn.f === 0 ? chordCX : undefined, isNext, skipLabel, isRepeat, 0.55);
                         lastFretForString[cn.s] = cn.f;
                         if (cn.f > 0 && ch.t <= t1) { fMin = Math.min(fMin, cn.f); fMax = Math.max(fMax, cn.f); got = true; }
+                        if (cn.f > 0 && chWindowed) { camWX += fretMid(cn.f) * chW; camWSum += chW; }
                     }
 
                     // Chord frame-box
@@ -2433,9 +2479,17 @@
             }
 
             // ── Camera target ─────────────────────────────────────────────
+            // tgtDist still tracks the visible-window fret span so wide
+            // chords pull the camera back; tgtX uses the narrowed,
+            // recency-weighted centroid with a hysteresis dead zone so
+            // small intra-cluster shifts don't produce visible motion.
             if (got) {
-                tgtX   = fretMid(Math.round((fMin + fMax) / 2));
                 tgtDist = (65 + Math.max(fMax - fMin, 4) * 3) * K;
+            }
+            if (camWSum > 0) {
+                const candidateX = camWX / camWSum;
+                const hystWorld  = camHystF * FRET_WIDTH_MID;
+                if (Math.abs(candidateX - tgtX) > hystWorld) tgtX = candidateX;
             }
 
             // ── Chord diagram: track most recently hit chord in linger window ─

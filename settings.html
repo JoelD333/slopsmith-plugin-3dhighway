@@ -111,6 +111,47 @@
     </div>
 </div>
 
+<div role="group" aria-labelledby="h3d-camera-heading" class="mt-6">
+    <h3 id="h3d-camera-heading" class="text-sm font-medium text-gray-400 mb-2">3D Highway — Camera</h3>
+    <p class="text-xs text-gray-500 mb-3">
+        Controls how aggressively the camera chases your upcoming notes
+        side-to-side along the fretboard. The camera always tracks where
+        you're playing, but inside a single position it can over-correct
+        for every nearby fret and end up jittering left and right while
+        you're really just playing a tight scale run or trill.
+    </p>
+    <p class="text-xs text-gray-500 mb-3">
+        Lower values (toward <em>Twitchy</em>) make the camera respond
+        quickly to every shift, even small ones — useful if you want the
+        view to stay tightly centered on the next note at all times, and
+        you don't mind extra motion. Higher values (toward <em>Calm</em>)
+        ignore small intra-position movement and only pan when the
+        upcoming notes really shift to a new region of the neck (e.g. an
+        open-position riff into a 12th-fret solo). Large position
+        changes still pan smoothly at any setting.
+    </p>
+    <p class="text-xs text-gray-500 mb-3">
+        Default is in the middle. If the camera still feels twitchy on
+        fast scale work, dial up toward Calm; if it feels lazy responding
+        to bigger position changes, dial down toward Twitchy. Changes
+        apply immediately while playing — no reload required.
+    </p>
+
+    <div class="mt-3">
+        <label for="h3d-camera-smoothing" class="text-xs font-medium text-gray-400 mb-1 block">
+            Camera smoothing: <span id="h3d-camera-smoothing-label">0.50</span>
+        </label>
+        <input type="range" id="h3d-camera-smoothing" min="0" max="1" step="0.05" value="0.5"
+            oninput="document.getElementById('h3d-camera-smoothing-label').textContent = parseFloat(this.value).toFixed(2);"
+            onchange="window.h3dBgSetCameraSmoothing && window.h3dBgSetCameraSmoothing(this.value)"
+            class="w-full accent-accent">
+        <div class="flex justify-between text-[10px] text-gray-500 mt-1">
+            <span>Twitchy</span>
+            <span>Calm</span>
+        </div>
+    </div>
+</div>
+
 <div role="group" aria-labelledby="h3d-notes-heading" class="mt-6">
     <h3 id="h3d-notes-heading" class="text-sm font-medium text-gray-400 mb-2">3D Highway — Notes</h3>
     <p class="text-xs text-gray-500 mb-3">
@@ -135,7 +176,7 @@
          no-selection / NaN state. -->
     <script>
         (function () {
-            const DEFAULTS = { style: 'particles', intensity: 0.5, reactive: true, palette: 'default', showFretOnNote: false, customImageDataUrl: '', customImageName: '', customVideoName: '' };
+            const DEFAULTS = { style: 'particles', intensity: 0.5, reactive: true, palette: 'default', showFretOnNote: false, cameraSmoothing: 0.5, customImageDataUrl: '', customImageName: '', customVideoName: '' };
             const VALID_STYLES = new Set(['off', 'particles', 'silhouettes', 'lights', 'geometric', 'image', 'video']);
             const VALID_PALETTES = new Set(['default', 'neon', 'pastel']);
             // Custom images are persisted as base64 data URLs in
@@ -195,6 +236,15 @@
                 if (!Number.isFinite(n)) return DEFAULTS.intensity;
                 return Math.max(0, Math.min(1, n));
             }
+            // Same shape as coerceIntensity (0..1 clamp + parseFloat) but
+            // backed by a different default. Keep separate so a future
+            // bound change on either setting doesn't accidentally drag
+            // the other along.
+            function coerceCameraSmoothing(v) {
+                const n = parseFloat(v);
+                if (!Number.isFinite(n)) return DEFAULTS.cameraSmoothing;
+                return Math.max(0, Math.min(1, n));
+            }
             function coerceBool(v, fallback) {
                 if (v === null || v === undefined) return fallback;
                 if (v === 'true'  || v === '1') return true;
@@ -203,6 +253,7 @@
             }
 
             let storedStyle = null, storedI = null, storedR = null, storedPalette = null, storedFretOnNote = null;
+            let storedCameraSmoothing = null;
             let storedCustomImageDataUrl = null, storedCustomImageName = null;
             let storedCustomVideoName = null;
             try {
@@ -211,6 +262,7 @@
                 storedR = localStorage.getItem('h3d_bg_reactive');
                 storedPalette = localStorage.getItem('h3d_bg_palette');
                 storedFretOnNote = localStorage.getItem('h3d_bg_showFretOnNote');
+                storedCameraSmoothing = localStorage.getItem('h3d_bg_cameraSmoothing');
                 storedCustomImageDataUrl = localStorage.getItem('h3d_bg_customImageDataUrl');
                 storedCustomImageName = localStorage.getItem('h3d_bg_customImageName');
                 storedCustomVideoName = localStorage.getItem('h3d_bg_customVideoName');
@@ -221,6 +273,7 @@
             const reactive = coerceBool(storedR, DEFAULTS.reactive);
             const palette = coercePalette(storedPalette);
             const showFretOnNote = coerceBool(storedFretOnNote, DEFAULTS.showFretOnNote);
+            const cameraSmoothing = coerceCameraSmoothing(storedCameraSmoothing);
             const customImageDataUrl = (typeof storedCustomImageDataUrl === 'string') ? storedCustomImageDataUrl : DEFAULTS.customImageDataUrl;
             const customImageName    = (typeof storedCustomImageName === 'string')    ? storedCustomImageName    : DEFAULTS.customImageName;
             const customVideoName    = (typeof storedCustomVideoName === 'string')    ? storedCustomVideoName    : DEFAULTS.customVideoName;
@@ -231,6 +284,8 @@
             const rea = document.getElementById('h3d-bg-reactive');
             const pal = document.getElementById('h3d-palette');
             const fon = document.getElementById('h3d-show-fret-on-note');
+            const csli = document.getElementById('h3d-camera-smoothing');
+            const clbl = document.getElementById('h3d-camera-smoothing-label');
             const fileInput = document.getElementById('h3d-bg-custom-image-file');
             const clearBtn  = document.getElementById('h3d-bg-custom-image-clear');
             const nameP     = document.getElementById('h3d-bg-custom-image-name');
@@ -244,6 +299,8 @@
             if (pal) pal.value = palette;
             if (rea) rea.checked = reactive;
             if (fon) fon.checked = showFretOnNote;
+            if (csli) csli.value = String(cameraSmoothing);
+            if (clbl) clbl.textContent = cameraSmoothing.toFixed(2);
 
             function imageOption() {
                 if (!sel) return null;
