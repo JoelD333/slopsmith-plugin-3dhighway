@@ -42,10 +42,10 @@
     const S_COL = PALETTES.default;
 
     const SCALE = 2.25;
-    const K     = SCALE / 300;
+    const K = SCALE / 300;
 
     const NFRETS = 24;
-    const NSTR   = 6;
+    const NSTR = 6;
     // Per-string materials and projection meshes are built via S_COL.map(),
     // so the renderer can only address strings 0..S_COL.length-1. Using a
     // higher count would index undefined into mGlow/mStr/mSus/projMeshArr.
@@ -70,27 +70,27 @@
     const STR_THICK = 0.25 * K;
 
     const S_BASE = 3 * K;
-    const S_GAP  = 4 * K;
+    const S_GAP = 4 * K;
 
-    const AHEAD  = 3.0;
+    const AHEAD = 3.0;
     const BEHIND = 0.5;
-    const TS     = 200 * K;
+    const TS = 200 * K;
 
     // Shorter, flatter notes (joel style)
     const NW = 5 * K, NH = 3 * K, ND = 0.5 * K;
     const N_RAD = 1.5 * K;
     const SW = 2 * K, SH = 1.5 * K;
 
-    const CAM_H_BASE    = 150 * K;
+    const CAM_H_BASE = 150 * K;
     const CAM_DIST_BASE = 240 * K;
-    const REF_ASPECT    = 16 / 9;
-    const FOCUS_D       = 600 * K;
+    const REF_ASPECT = 16 / 9;
+    const FOCUS_D = 600 * K;
     const CAM_LERP_BASE = 0.02;
 
     const FOG_START = 200 * K;
-    const FOG_END   = 670 * K;
+    const FOG_END = 670 * K;
 
-    const DOTS  = [3, 5, 7, 9, 12, 15, 17, 19, 21, 24];
+    const DOTS = [3, 5, 7, 9, 12, 15, 17, 19, 21, 24];
     const DDOTS = new Set([12, 24]);
 
     const FRET_COOLDOWN = 0.5; // seconds a lane fret stays active after last note
@@ -101,15 +101,15 @@
 
     function bendText(bn) {
         if (bn === 0.5) return '½';
-        if (bn === 1)   return 'full';
+        if (bn === 1) return 'full';
         if (bn === 1.5) return '1½';
-        if (bn >= 2)    return String(Math.round(bn));
+        if (bn >= 2) return String(Math.round(bn));
         return bn.toFixed(1);
     }
 
-    const fretX   = f => (f <= 0 ? 0 : SCALE - SCALE / Math.pow(2, f / 12));
+    const fretX = f => (f <= 0 ? 0 : SCALE - SCALE / Math.pow(2, f / 12));
     const fretMid = f => (f <= 0 ? -2 * K : (fretX(f - 1) + fretX(f)) / 2);
-    const dZ      = dt => -dt * TS;
+    const dZ = dt => -dt * TS;
 
     function computeBPM(beats, t) {
         if (!beats || beats.length < 2) return 120;
@@ -122,7 +122,7 @@
         if (lo === beats.length) closest = beats.length - 1;
         else if (lo > 0 && Math.abs(beats[lo - 1].time - t) < Math.abs(beats[lo].time - t)) closest = lo - 1;
         const start = Math.max(0, closest - 2);
-        const end   = Math.min(beats.length - 1, closest + 2);
+        const end = Math.min(beats.length - 1, closest + 2);
         let sum = 0, count = 0;
         for (let i = start; i < end; i++) {
             const dt = beats[i + 1].time - beats[i].time;
@@ -158,15 +158,15 @@
         const ss = window.slopsmithSplitscreen;
         if (!ss || typeof ss.isActive !== 'function' || !ss.isActive()) return false;
         return typeof ss.isCanvasFocused === 'function'
-            && typeof ss.onFocusChange   === 'function'
-            && typeof ss.offFocusChange  === 'function';
+            && typeof ss.onFocusChange === 'function'
+            && typeof ss.offFocusChange === 'function';
     }
 
     function _ssIsCanvasFocused(highwayCanvas) {
         const ss = window.slopsmithSplitscreen;
         if (!_ssActive()) return true;
         return !!(ss && typeof ss.isCanvasFocused === 'function' &&
-                  ss.isCanvasFocused(highwayCanvas));
+            ss.isCanvasFocused(highwayCanvas));
     }
 
     /* ======================================================================
@@ -274,17 +274,17 @@
         _bgBandsLastT = t;
         a.analyser.getByteFrequencyData(a.freq);
         let bass = 0, mid = 0, treble = 0;
-        for (let i = 0; i < 8;   i++) bass   += a.freq[i];
-        for (let i = 8; i < 40;  i++) mid    += a.freq[i];
+        for (let i = 0; i < 8; i++) bass += a.freq[i];
+        for (let i = 8; i < 40; i++) mid += a.freq[i];
         for (let i = 40; i < 128; i++) treble += a.freq[i];
-        _bgBandsCache.bass   = bass   / (8 * 255);
-        _bgBandsCache.mid    = mid    / (32 * 255);
+        _bgBandsCache.bass = bass / (8 * 255);
+        _bgBandsCache.mid = mid / (32 * 255);
         _bgBandsCache.treble = treble / (88 * 255);
         return _bgBandsCache;
     }
 
-    const BG_DEFAULTS = { style: 'particles', intensity: 0.5, reactive: true, palette: 'default', showFretOnNote: false, customImageDataUrl: '', customImageName: '' };
-    const BG_STYLE_IDS = ['off', 'particles', 'silhouettes', 'lights', 'geometric', 'image'];
+    const BG_DEFAULTS = { style: 'particles', intensity: 0.5, reactive: true, palette: 'default', showFretOnNote: false };
+    const BG_STYLE_IDS = ['off', 'particles', 'silhouettes', 'lights', 'geometric'];
 
     function _bgPanelKey(canvas) {
         const ss = window.slopsmithSplitscreen;
@@ -300,30 +300,13 @@
     // just picked in settings.html.
     const _bgMemFallback = Object.create(null);
     function _bgReadSetting(panelKey, key) {
-        // Per-panel override wins first, since per-panel state isn't
-        // staged in _bgMemFallback (only the global setters write
-        // there). A manual h3d_bg_panel<idx>_* edit should still
-        // override the global as designed.
         try {
             const panelVal = localStorage.getItem('h3d_bg_' + panelKey + '_' + key);
             if (panelVal !== null && panelVal !== undefined) return _bgCoerce(key, panelVal);
-        } catch (_) { /* storage blocked — fall through */ }
-        // For the global slot: check the in-memory fallback BEFORE
-        // localStorage. The setter populates _bgMemFallback even when
-        // localStorage.setItem fails on quota, so a failed write
-        // would otherwise leave the renderer pointed at the stale
-        // localStorage value while the UI shows the new selection
-        // (a 1.5 MB custom image staged in localStorage can push the
-        // origin near quota, then the next style/intensity change
-        // silently fails to apply in-session). Since the in-memory
-        // fallback is only populated AFTER a write attempt, fresh
-        // page loads still fall through to localStorage and pick up
-        // persisted user settings.
-        if (key in _bgMemFallback) return _bgCoerce(key, _bgMemFallback[key]);
-        try {
             const globalVal = localStorage.getItem('h3d_bg_' + key);
             if (globalVal !== null && globalVal !== undefined) return _bgCoerce(key, globalVal);
-        } catch (_) { /* storage blocked */ }
+        } catch (_) { /* storage blocked — fall through to in-memory */ }
+        if (key in _bgMemFallback) return _bgCoerce(key, _bgMemFallback[key]);
         return BG_DEFAULTS[key];
     }
     // Shared "stored string -> bool" coercion for every boolean
@@ -334,7 +317,7 @@
     // up via the dispatch below.
     const _BG_BOOL_KEYS = new Set(['reactive', 'showFretOnNote']);
     function _bgCoerceBool(val, fallback) {
-        if (val === 'true'  || val === '1') return true;
+        if (val === 'true' || val === '1') return true;
         if (val === 'false' || val === '0') return false;
         return fallback;
     }
@@ -370,28 +353,14 @@
 
     // Settings.html setters — global keys; per-panel overrides via direct
     // localStorage edits today, runtime UI in a follow-up.
-    window.h3dBgSetStyle     = (v) => _bgWriteGlobal('style', v);
+    window.h3dBgSetStyle = (v) => _bgWriteGlobal('style', v);
     window.h3dBgSetIntensity = (v) => _bgWriteGlobal('intensity', v);
-    window.h3dBgSetReactive  = (v) => _bgWriteGlobal('reactive', !!v);
-    window.h3dBgSetPalette   = (v) => _bgWriteGlobal('palette', v);
+    window.h3dBgSetReactive = (v) => _bgWriteGlobal('reactive', !!v);
+    window.h3dBgSetPalette = (v) => _bgWriteGlobal('palette', v);
     window.h3dBgSetShowFretOnNote = (v) => _bgWriteGlobal('showFretOnNote', !!v);
-    // Custom image asset for the 'image' bg style (#19). Composite setter:
-    // writes both the data URL (the bytes that drive the texture) and the
-    // display filename, each emitting a change event. The listener
-    // rebuilds on customImageDataUrl change when the image style is
-    // active; customImageName is display-only and skips rebuild.
-    window.h3dBgSetCustomImage = (asset) => {
-        const a = asset || {};
-        _bgWriteGlobal('customImageDataUrl', a.dataUrl || '');
-        _bgWriteGlobal('customImageName', a.name || '');
-    };
-    window.h3dBgClearCustomImage = () => {
-        _bgWriteGlobal('customImageDataUrl', '');
-        _bgWriteGlobal('customImageName', '');
-    };
     // Back-compat alias for any caller that picked up the original
     // (inconsistent) name during this PR's review window.
-    window.h3dSetPalette     = window.h3dBgSetPalette;
+    window.h3dSetPalette = window.h3dBgSetPalette;
 
     // Procedural silhouette bitmap, drawn once and shared across panels.
     // The Canvas2D bitmap is module-level (cheap, CPU-only); each layer
@@ -431,15 +400,15 @@
     const BG_STYLES = {
         off: {
             build() { return null; },
-            update() {},
-            teardown() {},
+            update() { },
+            teardown() { },
         },
         particles: {
             build(scene, settings) {
                 const N = Math.max(20, Math.floor(80 + 200 * settings.intensity));
                 const positions = new Float32Array(N * 3);
                 for (let i = 0; i < N; i++) {
-                    positions[i * 3]     = (Math.random() - 0.5) * 800 * K;
+                    positions[i * 3] = (Math.random() - 0.5) * 800 * K;
                     positions[i * 3 + 1] = (Math.random() - 0.4) * 80 * K;
                     // Spawn within the visible fog range. Fog reaches
                     // its far limit at FOG_END * 1.2 from the camera,
@@ -673,188 +642,6 @@
                 }
             },
         },
-        // Custom image backdrop (#19). User uploads a JPG/PNG/WebP
-        // through settings.html; the bytes are persisted as a base64
-        // data URL in localStorage under h3d_bg_customImageDataUrl and
-        // passed in via settings.customImageDataUrl. Renders as a
-        // PlaneGeometry in the silhouette parallax band, "cover" cropped
-        // (via texture.repeat / offset) so non-matching aspects fill
-        // the plane without distortion. Slow horizontal drift on
-        // texture.offset.x for life. When no asset is uploaded, build
-        // returns null and the style is inert (settings.html disables
-        // the picker option in that case).
-        image: {
-            build(scene, settings) {
-                // Upfront validation: only accept the same raster image
-                // formats settings.html lets the user upload (jpeg /
-                // png / webp). Without this, a corrupt localStorage
-                // value (truncated base64, wrong scheme, plain string)
-                // OR an unsupported type (e.g. data:image/svg+xml)
-                // reaches TextureLoader and can fail asynchronously
-                // after the plane has been mounted — a silent black
-                // backdrop with no clear cause. Returning null here
-                // treats invalid bytes the same as "no asset uploaded":
-                // style is inert, the user can clear and re-upload
-                // from settings.html.
-                const dataUrl = (typeof settings.customImageDataUrl === 'string')
-                    ? settings.customImageDataUrl.trim() : '';
-                if (!/^data:image\/(jpeg|png|webp);/i.test(dataUrl)) return null;
-                // Renderer-side encoded-length cap. settings.html
-                // enforces the same limit on upload, but a manually
-                // edited localStorage value (or legacy data from
-                // before the upload guard existed) could still feed
-                // an arbitrarily large data URL into TextureLoader
-                // and burn memory / CPU during decode. Treat overlong
-                // values as "no asset" — style is inert, user can
-                // clear and re-upload from settings.
-                if (dataUrl.length > 2.5 * 1024 * 1024) return null;
-                const planeW = 400 * K, planeH = 120 * K;
-                const planeAspect = planeW / planeH;
-                // Renderer-side decompression-bomb caps. Mirror
-                // settings.html's upload-time guard so a manual
-                // localStorage edit (or legacy data from before that
-                // guard existed) can't sneak a 50000×50000 PNG past
-                // and OOM the GPU on texture upload.
-                const MAX_IMAGE_DIM = 4096;
-                const MAX_IMAGE_PIXELS = 16 * 1024 * 1024;
-                // Build the state object upfront so async TextureLoader
-                // callbacks can write back into it (loaded flag, mesh
-                // visibility, drift reset). update() reads s.loaded
-                // before advancing drift, which keeps the initial
-                // texture offset deterministic regardless of how long
-                // the async decode takes.
-                const state = {
-                    mesh: null, geo: null, mat: null, tex: null,
-                    drift: 0.5, intensity: settings.intensity, loaded: false,
-                };
-                const tex = new T.TextureLoader().load(
-                    dataUrl,
-                    (loaded) => {
-                        // Image dimensions are only known after async decode.
-                        const imgW = loaded.image?.width  || 0;
-                        const imgH = loaded.image?.height || 0;
-                        if (imgW > MAX_IMAGE_DIM || imgH > MAX_IMAGE_DIM || (imgW * imgH) > MAX_IMAGE_PIXELS) {
-                            // Bail before the texture gets uploaded to
-                            // the GPU (Three.js uploads on first render
-                            // of a visible mesh — hiding the mesh here
-                            // skips that). Disposing the texture too,
-                            // belt-and-suspenders, in case anything
-                            // else holds a reference.
-                            console.warn('[3D-Hwy] custom image dimensions too large to render', imgW + 'x' + imgH);
-                            if (state.mesh) state.mesh.visible = false;
-                            loaded.dispose();
-                            return;
-                        }
-                        // Cover-crop: smaller repeat = more zoom on the
-                        // image (shows a fraction of the texture
-                        // stretched across the plane), which is the right
-                        // tool for "fill plane, crop overflow".
-                        if (imgW > 0 && imgH > 0) {
-                            const imgAspect = imgW / imgH;
-                            if (imgAspect > planeAspect) {
-                                loaded.repeat.x = planeAspect / imgAspect;
-                                loaded.offset.x = (1 - loaded.repeat.x) * 0.5;
-                            } else {
-                                loaded.repeat.y = imgAspect / planeAspect;
-                                loaded.offset.y = (1 - loaded.repeat.y) * 0.5;
-                            }
-                            loaded.needsUpdate = true;
-                        }
-                        // Reset drift to the centered triangle-wave
-                        // phase now that repeat.x is final. Without
-                        // this reset, drift accumulated during the
-                        // async decode would phase-shift the initial
-                        // offset by a non-deterministic amount —
-                        // wider images would open at whatever crop
-                        // the elapsed-decode-time happened to land on.
-                        state.drift = 0.5;
-                        state.loaded = true;
-                    },
-                    undefined,
-                    // Async-failure path: the upfront regex catches the
-                    // common "corrupted/truncated bytes" case, but a
-                    // valid-looking data URL can still fail to decode
-                    // (e.g. wrong MIME / unsupported codec). Hide the
-                    // mesh so we don't paint a frozen blank plane on
-                    // top of fog, and log so the failure isn't silent.
-                    (err) => {
-                        console.error('[3D-Hwy] custom image decode failed', err);
-                        if (state.mesh) state.mesh.visible = false;
-                    },
-                );
-                tex.colorSpace = T.SRGBColorSpace;
-                // ClampToEdge on both axes — user uploads are non-
-                // power-of-two in general, and WebGL1 rejects RepeatWrapping
-                // on NPOT textures (renders black or emits GL errors). The
-                // drift logic below uses a triangle-wave so the offset
-                // stays inside [0, 1-repeat] and never needs wrap.
-                tex.wrapS = T.ClampToEdgeWrapping;
-                tex.wrapT = T.ClampToEdgeWrapping;
-                // User uploads aren't power-of-two in general; mipmaps
-                // are noisy for a single static backdrop and burn memory.
-                tex.generateMipmaps = false;
-                tex.minFilter = T.LinearFilter;
-                tex.magFilter = T.LinearFilter;
-                const geo = new T.PlaneGeometry(planeW, planeH);
-                const mat = new T.MeshBasicMaterial({
-                    map: tex, transparent: false, depthWrite: false, fog: true,
-                });
-                const mesh = new T.Mesh(geo, mat);
-                // z = -FOG_END * 0.7 matches silhouette layer 2 (-0.70)
-                // so the image reads as part of the same parallax band.
-                // The image and silhouette styles are mutually exclusive
-                // (only one bg style mounts at a time), so co-planarity
-                // is fine — no z-fighting risk. y = 5*K lifts it
-                // slightly so the plane center aligns with the upper
-                // fog band (silhouettes sit at y = -10*K).
-                mesh.position.set(0, 5 * K, -FOG_END * 0.7);
-                scene.add(mesh);
-                state.mesh = mesh;
-                state.geo  = geo;
-                state.mat  = mat;
-                state.tex  = tex;
-                return state;
-            },
-            update(s, bands, dt) {
-                if (!s) return;
-                // Skip drift advance until the texture has finished
-                // decoding. Without this guard, drift accumulates
-                // during the async load while repeat.x is still 1
-                // (its default), and once the cover-crop applies the
-                // image opens at a phase-shifted offset whose value
-                // depends on how long the decode took — the
-                // "centered start" intent becomes non-deterministic.
-                if (!s.loaded) return;
-                // Triangle-wave ping-pong drift inside the cropped slack.
-                // ClampToEdge on wrapS means we cannot wrap across the
-                // texture boundary (would render edge pixels stretched);
-                // ping-pong oscillates the visible window between the
-                // image's left and right edges, which gives the same
-                // "alive" feel without the WebGL1 NPOT-Repeat hazard.
-                // Slack is the horizontal margin between the cropped
-                // window and the texture edges; for taller-than-plane
-                // images repeat.x stays 1, slack collapses to 0, and
-                // the offset stays at 0 — the image sits still, which
-                // is correct (it's already filling horizontally).
-                s.drift += dt * 0.02 * s.intensity;
-                const slack = Math.max(0, 1 - s.tex.repeat.x);
-                // Period of 2 drift units ≈ 100 s at intensity = 0.5;
-                // gentle, cinematic. cyc ∈ [0, 2), tri ∈ [0, 1] then back.
-                const cyc = ((s.drift % 2) + 2) % 2;
-                const tri = cyc < 1 ? cyc : 2 - cyc;
-                s.tex.offset.x = tri * slack;
-            },
-            teardown(s) {
-                if (!s) return;
-                s.mesh.parent && s.mesh.parent.remove(s.mesh);
-                s.geo.dispose();
-                s.mat.dispose();
-                // This style owns the texture lifecycle (per the comment
-                // at _bgDisposeGroupTree: tree dispose does NOT touch
-                // material.map textures).
-                s.tex.dispose();
-            },
-        },
     };
 
     /* ======================================================================
@@ -875,7 +662,7 @@
         let wrap = null;
         let ambLight = null, dirLight = null;
         let fretG = null, noteG = null, beatG = null, lblG = null;
-        let gNote = null, gSus = null, gBeat = null;
+        let gNote = null, gSus = null, gBeat = null, gTechArrow = null, gTapChevron = null;
         let mStr = [], mGlow = [], mSus = [], mProj = [], mProjGlow = [];
         let mWhiteOutline = null, mSusOutline = null;
         // Notedetect feedback outlines (issue #9). Created in initScene
@@ -915,11 +702,6 @@
         // by default — opt-in setting for players who like the at-a-
         // glance fret cue.
         let showFretOnNote = false;
-        // Custom image asset (issue #19). Data URL is the bytes that
-        // drive the 'image' bg style's texture; name is display-only
-        // metadata that settings.html shows next to the file picker.
-        let bgCustomImageDataUrl = '';
-        let bgCustomImageName = '';
         let _bgListener = null;
         let _bgLastT = 0;  // ms timestamp for dt
 
@@ -944,7 +726,7 @@
         let pNote, pSus, pLbl, pBeat, pSec;
         let pFretLbl, pLane, pLaneDivider;
         let pChordBox, pChordLbl, pBarreLine;
-        let pNoteFretLabel, pConnectorLine, pDropLine;
+        let pNoteFretLabel, pConnectorLine, pDropLine, pTechArrow, pTapChevron;
 
         // Dynamic glowing string meshes (BoxGeometry, one per string)
         let stringLines = [];
@@ -997,12 +779,12 @@
         let aspectScale = 1;
 
         // Lifecycle flags
-        let _isReady       = false;
-        let _destroyed     = false;
-        let _invertedCached    = false;
-        let _invertedForBoard  = false;
-        let _initToken     = 0;
-        let highwayCanvas      = null;
+        let _isReady = false;
+        let _destroyed = false;
+        let _invertedCached = false;
+        let _invertedForBoard = false;
+        let _initToken = 0;
+        let highwayCanvas = null;
 
         // ── Focus state (splitscreen dim) ─────────────────────────────────
         let _focusSubscribed = false;
@@ -1022,7 +804,7 @@
             if (focused === _isFocused) return;
             _isFocused = focused;
             if (ambLight) ambLight.intensity = focused ? 0.85 : 0.4;
-            if (dirLight) dirLight.intensity = focused ? 0.8  : 0.35;
+            if (dirLight) dirLight.intensity = focused ? 0.8 : 0.35;
         }
 
         // ── String-to-Y (respects invert) ─────────────────────────────────
@@ -1071,14 +853,14 @@
             const MARKER = Math.round(CELL * 0.7);
             const gridW = CELL * (COLS - 1);
             const gridH = CELL * ROWS;
-            const boxW  = gridW + PAD * 2;
-            const boxH  = HEADER + MARKER + gridH + PAD;
+            const boxW = gridW + PAD * 2;
+            const boxH = HEADER + MARKER + gridH + PAD;
             const bx = PAD, by = PAD;
             const gx = bx + PAD, gy = by + HEADER + MARKER;
             const opacity = Math.max(0, 1 + chDt / 0.55);
 
             const playedFrets = frets.filter(f => f > 0);
-            const minFret   = playedFrets.length > 0 ? Math.min(...playedFrets) : 1;
+            const minFret = playedFrets.length > 0 ? Math.min(...playedFrets) : 1;
             const startFret = Math.max(1, minFret);
             const isFirstPos = startFret === 1;
 
@@ -1175,20 +957,20 @@
                 currentIdx = 0;
             }
             const currentLine = allLines[currentIdx];
-            const nextLine    = allLines[currentIdx + 1] || null;
-            const gapToNext   = nextLine ? (nextLine.start - currentLine.end) : Infinity;
+            const nextLine = allLines[currentIdx + 1] || null;
+            const gapToNext = nextLine ? (nextLine.start - currentLine.end) : Infinity;
             if (currentTime > currentLine.end + 0.5 && gapToNext > 3.0) return;
 
             const linesToShow = [currentLine];
             if (nextLine && gapToNext <= 3.0) linesToShow.push(nextLine);
 
-            const fontSize    = Math.max(18, H * 0.028) | 0;
-            const lineY       = H * 0.04;
-            const sylText     = s => { const t = s.w || ''; return (t.endsWith('+') || t.endsWith('-')) ? t.slice(0, -1) : t; };
+            const fontSize = Math.max(18, H * 0.028) | 0;
+            const lineY = H * 0.04;
+            const sylText = s => { const t = s.w || ''; return (t.endsWith('+') || t.endsWith('-')) ? t.slice(0, -1) : t; };
 
             ctx.font = `bold ${fontSize}px sans-serif`;
             const spaceWidth = ctx.measureText(' ').width;
-            const maxWidth   = W * 0.8;
+            const maxWidth = W * 0.8;
 
             const rows = [];
             for (const authoredLine of linesToShow) {
@@ -1210,7 +992,7 @@
                 if (row.length) rows.push(row);
             }
 
-            const rowHeight   = fontSize + 6;
+            const rowHeight = fontSize + 6;
             const totalHeight = rows.length * rowHeight + 10;
             let bgWidth = 0;
             for (const row of rows) {
@@ -1244,7 +1026,7 @@
                     for (const part of w.parts) {
                         const l = part.syl;
                         const isActive = currentTime >= l.t && currentTime < l.t + l.d;
-                        const isPast   = currentTime >= l.t + l.d;
+                        const isPast = currentTime >= l.t + l.d;
                         ctx.fillStyle = isActive ? '#4ae0ff' : isPast ? '#8899aa' : '#556677';
                         ctx.font = `${isActive ? 'bold' : 'normal'} ${fontSize}px sans-serif`;
                         ctx.fillText(part.text, xPos, yPos);
@@ -1266,7 +1048,7 @@
             fretLastActiveTime.fill(0);
 
             wrap = document.createElement('div');
-            wrap.id        = 'h3d-wrap-' + _instanceId;
+            wrap.id = 'h3d-wrap-' + _instanceId;
             wrap.className = 'h3d-wrap';
             wrap.dataset.h3dInstance = String(_instanceId);
             wrap.style.cssText = 'position:absolute;top:0;left:0;right:0;z-index:2;pointer-events:none;';
@@ -1296,18 +1078,56 @@
             fretG = new T.Group(); scene.add(fretG);
             noteG = new T.Group(); scene.add(noteG);
             beatG = new T.Group(); scene.add(beatG);
-            lblG  = new T.Group(); scene.add(lblG);
+            lblG = new T.Group(); scene.add(lblG);
 
             // Rectangular note geometry
             gNote = new T.BoxGeometry(NW, NH, ND);
 
-            gSus  = new T.BoxGeometry(1, 1, 1);
+            gSus = new T.BoxGeometry(1, 1, 1);
             gBeat = new T.BufferGeometry().setFromPoints(
                 [new T.Vector3(0, 0, 0), new T.Vector3(1, 0, 0)],
             );
+            const arrowShape = new T.Shape();
+            arrowShape.moveTo(-0.5, 0);
+            arrowShape.lineTo(0, 1);
+            arrowShape.lineTo(0.5, 0);
+            arrowShape.closePath();
+            gTechArrow = new T.ExtrudeGeometry(arrowShape, {
+                depth: 0.04 * K,
+                bevelEnabled: false,
+            });
+            gTechArrow.translate(0, -0.5, 0); // Center the geometry vertically
+
+            // Tap chevron (open V pointing downward) — line segments
+
+            const chevronShape = new T.Shape();
+
+            // Adjusting points for a "stubby" look
+            // Width: increased to +/- 0.8 for a broader look
+            // Height: capped at 0.2 to make it significantly shorter
+            chevronShape.moveTo(-0.6, 0.3);   // Top left point (further out, lower down)
+            chevronShape.lineTo(0, -0.1);     // Interior vertex (shallower V)
+            chevronShape.lineTo(0.6, 0.3);    // Top right point (further out, lower down)
+
+            chevronShape.lineTo(0.8, 0.0);    // Right outer thickness point
+            chevronShape.lineTo(0, -0.3);     // Bottom vertex / Outer point (less deep)
+            chevronShape.lineTo(-0.8, 0.0);   // Left outer thickness point
+
+            chevronShape.closePath();
+
+            // Create the 3D mesh geometry with a small depth
+            gTapChevron = new T.ExtrudeGeometry(chevronShape, {
+                depth: 0.04 * K,
+                bevelEnabled: false,
+            });
+
+            // Optional: Center the geometry if the pivot point feels off
+            gTapChevron.computeBoundingBox();
+            const centerOffset = -0.5 * (gTapChevron.boundingBox.max.y + gTapChevron.boundingBox.min.y);
+            gTapChevron.translate(0, centerOffset, 0);
 
             // String materials: emissive so they glow when lit
-            mStr  = activePalette.map(c => new T.MeshStandardMaterial({
+            mStr = activePalette.map(c => new T.MeshStandardMaterial({
                 color: c, emissive: c, emissiveIntensity: 0.002,
                 transparent: true, opacity: 0.4, roughness: 1,
             }));
@@ -1331,9 +1151,9 @@
             // tints. Note rendering swaps its outline.material between
             // mWhiteOutline / mHitOutline / mMissOutline based on
             // recent notedetect events.
-            mHitOutline   = new T.MeshLambertMaterial({ color: 0x40ff70, emissive: 0x40ff70, emissiveIntensity: 1.0 });
-            mMissOutline  = new T.MeshLambertMaterial({ color: 0xff4040, emissive: 0xff4040, emissiveIntensity: 1.0 });
-            mSusOutline   = new T.MeshLambertMaterial({ color: 0xffffff, emissive: 0xffffff, emissiveIntensity: 0.3, transparent: true, opacity: 0.75, depthWrite: false });
+            mHitOutline = new T.MeshLambertMaterial({ color: 0x40ff70, emissive: 0x40ff70, emissiveIntensity: 1.0 });
+            mMissOutline = new T.MeshLambertMaterial({ color: 0xff4040, emissive: 0xff4040, emissiveIntensity: 1.0 });
+            mSusOutline = new T.MeshLambertMaterial({ color: 0xffffff, emissive: 0xffffff, emissiveIntensity: 0.3, transparent: true, opacity: 0.75, depthWrite: false });
             mBeatM = new T.LineBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.25 });
             mBeatQ = new T.LineBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.07 });
 
@@ -1353,12 +1173,32 @@
             });
 
             // ── Pools ──────────────────────────────────────────────────────
-            pNote       = pool(noteG, () => new T.Mesh(gNote, mStr[0]));
-            pSus        = pool(noteG, () => new T.Mesh(gSus, mSus[0]));
+            pNote = pool(noteG, () => new T.Mesh(gNote, mStr[0]));
+            pSus = pool(noteG, () => new T.Mesh(gSus, mSus[0]));
             pSusOutline = pool(noteG, () => new T.Mesh(gSus, mSusOutline));
-            pLbl  = pool(lblG,  () => new T.Sprite(txtMat('0', '#fff', false)));
+            pTechArrow = pool(noteG, () => new T.Mesh(gTechArrow, new T.MeshLambertMaterial({
+                color: 0xffffff,
+                emissive: 0xffffff,
+                emissiveIntensity: 0.9,
+                transparent: false,
+                opacity: 1.0,
+                side: T.DoubleSide,
+                depthWrite: true,
+            })));
+            pTapChevron = pool(noteG, () => {
+                return new T.Mesh(gTapChevron, new T.MeshLambertMaterial({
+                    color: 0xd4d4d4,
+                    emissive: 0xd4d4d4,
+                    emissiveIntensity: 0.9,
+                    transparent: false,
+                    opacity: 0.85,
+                    side: T.DoubleSide,
+                    depthWrite: true,
+                }));
+            });
+            pLbl = pool(lblG, () => new T.Sprite(txtMat('0', '#fff', false)));
             pBeat = pool(beatG, () => new T.Line(gBeat, mBeatQ));
-            pSec  = pool(lblG,  () => new T.Sprite(txtMat('', '#0dd', true)));
+            pSec = pool(lblG, () => new T.Sprite(txtMat('', '#0dd', true)));
 
             // Dynamic fret number labels (heat-coloured, updated each frame)
             pFretLbl = pool(lblG, () => new T.Sprite(txtMat('0', '#888', false)));
@@ -1385,8 +1225,8 @@
                 }),
             ));
 
-            pChordLbl   = pool(lblG,  () => new T.Sprite(txtMat('', '#e8d080', true).clone()));
-            pBarreLine  = pool(noteG, () => new T.Mesh(
+            pChordLbl = pool(lblG, () => new T.Sprite(txtMat('', '#e8d080', true).clone()));
+            pBarreLine = pool(noteG, () => new T.Mesh(
                 new T.BoxGeometry(1, 1, 1),
                 new T.MeshLambertMaterial({ color: 0xffffff, emissive: 0xffffff, emissiveIntensity: 0.9, transparent: true, depthWrite: false }),
             ));
@@ -1448,36 +1288,7 @@
                     if (bgStyleId === 'lights') _bgRebuild();
                     return;
                 }
-                if (changedKey === 'customImageDataUrl') {
-                    // Asset bytes changed. Rebuild only when the image
-                    // style is active — otherwise the new bytes will
-                    // pick up next time the user picks `image`.
-                    _bgLoadSettings();
-                    if (bgStyleId === 'image') _bgRebuild();
-                    return;
-                }
-                if (changedKey === 'customImageName') {
-                    // Display-only metadata; no mesh rebuild.
-                    _bgLoadSettings();
-                    return;
-                }
-                if (changedKey === 'intensity') {
-                    _bgLoadSettings();
-                    // Image style reads s.intensity per frame inside
-                    // update() to scale the drift speed, so a live
-                    // mutation is enough — no need to tear down and
-                    // re-decode the texture for every slider change.
-                    // The procedural styles bake intensity into mesh
-                    // count, opacity, and size at build time, so they
-                    // still need a full rebuild.
-                    if (bgStyleId === 'image' && bgState) {
-                        bgState.intensity = bgIntensity;
-                        return;
-                    }
-                    _bgRebuild();
-                    return;
-                }
-                if (!changedKey || changedKey === 'style') {
+                if (!changedKey || changedKey === 'style' || changedKey === 'intensity') {
                     _bgRebuild();
                 }
             };
@@ -1519,9 +1330,9 @@
                 arr.push({ s: d.note.s, f: d.note.f, noteTime: d.noteTime, expiresAt: now + _ND_TTL_MS });
                 return arr;
             };
-            _ndOnHit  = (e) => { _ndHitMarks  = _ndPushMark(_ndHitMarks,  e.detail); };
+            _ndOnHit = (e) => { _ndHitMarks = _ndPushMark(_ndHitMarks, e.detail); };
             _ndOnMiss = (e) => { _ndMissMarks = _ndPushMark(_ndMissMarks, e.detail); };
-            window.addEventListener('notedetect:hit',  _ndOnHit);
+            window.addEventListener('notedetect:hit', _ndOnHit);
             window.addEventListener('notedetect:miss', _ndOnMiss);
 
             return true;
@@ -1529,9 +1340,9 @@
 
         function _bgLoadSettings() {
             const panelKey = _bgPanelKey(highwayCanvas);
-            bgStyleId   = _bgReadSetting(panelKey, 'style');
+            bgStyleId = _bgReadSetting(panelKey, 'style');
             bgIntensity = _bgReadSetting(panelKey, 'intensity');
-            bgReactive  = _bgReadSetting(panelKey, 'reactive');
+            bgReactive = _bgReadSetting(panelKey, 'reactive');
             const newPaletteId = _bgReadSetting(panelKey, 'palette');
             const newPalette = PALETTES[newPaletteId] || PALETTES.default;
             if (newPalette !== activePalette) {
@@ -1539,34 +1350,6 @@
                 _applyPaletteToMaterials();
             }
             showFretOnNote = _bgReadSetting(panelKey, 'showFretOnNote');
-            // Custom image asset is a single GLOBAL slot — bytes are
-            // shared across panels (per-panel choice is which style
-            // each panel renders, not which asset). Reading via
-            // _bgReadSetting would let a stray h3d_bg_panel<idx>_*
-            // override silently re-introduce the per-panel asset
-            // duplication this design deliberately avoids (and
-            // h3dBgClearCustomImage wouldn't reach those overrides).
-            // Read globals directly instead.
-            //
-            // Precedence: in-memory fallback BEFORE localStorage. The
-            // setter always populates _bgMemFallback (even when the
-            // localStorage write fails on quota), so the fallback
-            // holds the most-recent staged value. Reading localStorage
-            // first would mean a failed write leaves the renderer
-            // pointed at the previous asset while settings.html shows
-            // a "session-only" warning claiming the new bytes are in
-            // effect — UI and renderer would silently disagree.
-            const memDataUrl = _bgMemFallback.customImageDataUrl;
-            const memName    = _bgMemFallback.customImageName;
-            try {
-                const gDataUrl = (memDataUrl !== undefined) ? memDataUrl : localStorage.getItem('h3d_bg_customImageDataUrl');
-                const gName    = (memName    !== undefined) ? memName    : localStorage.getItem('h3d_bg_customImageName');
-                bgCustomImageDataUrl = (gDataUrl != null) ? gDataUrl : BG_DEFAULTS.customImageDataUrl;
-                bgCustomImageName    = (gName    != null) ? gName    : BG_DEFAULTS.customImageName;
-            } catch (_) {
-                bgCustomImageDataUrl = (memDataUrl !== undefined) ? memDataUrl : BG_DEFAULTS.customImageDataUrl;
-                bgCustomImageName    = (memName    !== undefined) ? memName    : BG_DEFAULTS.customImageName;
-            }
         }
         // Live-swap palette by mutating existing materials in place.
         // Three.js colors propagate to all sharing meshes on the next
@@ -1588,13 +1371,13 @@
         function _applyPaletteToMaterials() {
             for (let s = 0; s < activePalette.length; s++) {
                 const c = activePalette[s];
-                if (mStr[s])      { mStr[s].color.setHex(c);  mStr[s].emissive.setHex(c); }
-                if (mGlow[s])       mGlow[s].emissive.setHex(c);
-                if (mSus[s])        mSus[s].color.setHex(c);
-                if (mProj[s])     { mProj[s].color.setHex(c); mProj[s].emissive.setHex(c); }
-                if (mProjGlow[s])   mProjGlow[s].emissive.setHex(c);
+                if (mStr[s]) { mStr[s].color.setHex(c); mStr[s].emissive.setHex(c); }
+                if (mGlow[s]) mGlow[s].emissive.setHex(c);
+                if (mSus[s]) mSus[s].color.setHex(c);
+                if (mProj[s]) { mProj[s].color.setHex(c); mProj[s].emissive.setHex(c); }
+                if (mProjGlow[s]) mProjGlow[s].emissive.setHex(c);
                 // Clones live on the projection meshes themselves.
-                const pm = projMeshArr  && projMeshArr[s];
+                const pm = projMeshArr && projMeshArr[s];
                 if (pm && pm.material) {
                     pm.material.color.setHex(c);
                     pm.material.emissive?.setHex?.(c);
@@ -1614,11 +1397,7 @@
             const stage = new T.Group();
             let result = null;
             try {
-                result = style.build(stage, {
-                    intensity: bgIntensity,
-                    palette: activePalette,
-                    customImageDataUrl: bgCustomImageDataUrl,
-                }) || null;
+                result = style.build(stage, { intensity: bgIntensity, palette: activePalette }) || null;
             } catch (e) {
                 console.error('[3D-Hwy] bg style build failed', bgStyleId, e);
                 _bgDisposeGroupTree(stage);
@@ -1706,7 +1485,7 @@
             // Fretboard plane
             const pg = new T.PlaneGeometry(bw, bl);
             const pm = new T.MeshLambertMaterial({ color: 0x08080e, transparent: true, opacity: 0.6 });
-            const p  = new T.Mesh(pg, pm);
+            const p = new T.Mesh(pg, pm);
             p.rotation.x = -Math.PI / 2;
             p.position.set(bw / 2 - 2 * K, S_BASE - NH / 2 - 2 * K, -bl / 2 + TS * BEHIND);
             fretG.add(p);
@@ -1714,7 +1493,7 @@
             // Thin Line strings (glow layer)
             for (let s = 0; s < nStr; s++) {
                 const pts = [new T.Vector3(-2 * K, sY(s), 0), new T.Vector3(fretX(NFRETS) + 2 * K, sY(s), 0)];
-                const g   = new T.BufferGeometry().setFromPoints(pts);
+                const g = new T.BufferGeometry().setFromPoints(pts);
                 fretG.add(new T.Line(g, new T.LineBasicMaterial({ color: activePalette[s], transparent: true, opacity: 0.15 })));
             }
 
@@ -1735,14 +1514,14 @@
             }
 
             // Fret wires
-            const yTop    = Math.max(sY(0), sY(nStr - 1));
+            const yTop = Math.max(sY(0), sY(nStr - 1));
             const yBottom = Math.min(sY(0), sY(nStr - 1));
             for (let f = 0; f <= NFRETS; f++) {
-                const x      = fretX(f);
+                const x = fretX(f);
                 const isMain = DOTS.includes(f);
                 const g = new T.BufferGeometry().setFromPoints([
                     new T.Vector3(x, yBottom - S_GAP * 0.3, 0),
-                    new T.Vector3(x, yTop    + S_GAP * 0.3, 0),
+                    new T.Vector3(x, yTop + S_GAP * 0.3, 0),
                 ]);
                 fretG.add(new T.Line(g, new T.LineBasicMaterial({
                     color: isMain ? 0xbbbbff : 0x666688,
@@ -1759,7 +1538,7 @@
                 const cx = fretMid(f);
                 if (DDOTS.has(f)) {
                     let d = new T.Mesh(dg, dm); d.position.set(cx, my - S_GAP * 0.7, 0); fretG.add(d);
-                    d = new T.Mesh(dg, dm);     d.position.set(cx, my + S_GAP * 0.7, 0); fretG.add(d);
+                    d = new T.Mesh(dg, dm); d.position.set(cx, my + S_GAP * 0.7, 0); fretG.add(d);
                 } else {
                     const d = new T.Mesh(dg, dm); d.position.set(cx, my, 0); fretG.add(d);
                 }
@@ -1768,9 +1547,9 @@
 
         /* ── String glow (called each frame) ────────────────────────────── */
         function updateStringHighlights(noteState) {
-            const BASE_GLOW  = 0.02;
-            const MAX_GLOW   = 3.5;
-            const IDLE_OP    = 0.4;
+            const BASE_GLOW = 0.02;
+            const MAX_GLOW = 3.5;
+            const IDLE_OP = 0.4;
 
             for (let s = 0; s < nStr; s++) {
                 const mesh = stringLines[s];
@@ -1780,14 +1559,14 @@
                     noteState.stringAnticipation[s] || 0,
                 );
                 mesh.material.emissiveIntensity = BASE_GLOW + intensity * MAX_GLOW;
-                mesh.material.opacity           = IDLE_OP   + intensity * (1 - IDLE_OP);
+                mesh.material.opacity = IDLE_OP + intensity * (1 - IDLE_OP);
                 mesh.scale.set(1, 1 + intensity * 0.3, 1 + intensity * 0.3);
             }
         }
 
         /* ── Per-frame rendering ─────────────────────────────────────────── */
         function update(bundle) {
-            pNote.reset(); pSus.reset(); pSusOutline.reset(); pLbl.reset();
+            pNote.reset(); pSus.reset(); pSusOutline.reset(); pTechArrow.reset(); pTapChevron.reset(); pLbl.reset();
             pBeat.reset(); pSec.reset();
             if (projMeshArr) for (const m of projMeshArr) m.visible = false;
             if (projGlowArr) for (const m of projGlowArr) m.visible = false;
@@ -1807,27 +1586,27 @@
             }
 
             const now = bundle.currentTime;
-            const t0  = now - BEHIND;
-            const t1  = now + AHEAD;
+            const t0 = now - BEHIND;
+            const t1 = now + AHEAD;
 
-            const notes    = bundle.notes;
-            const chords   = bundle.chords;
-            const beats    = bundle.beats;
+            const notes = bundle.notes;
+            const chords = bundle.chords;
+            const beats = bundle.beats;
             const sections = bundle.sections;
 
             // ── Frame state ───────────────────────────────────────────────
             const noteState = {
-                stringSustain:    new Array(nStr).fill(false),
+                stringSustain: new Array(nStr).fill(false),
                 stringAnticipation: new Array(nStr).fill(0),
-                fretHeat:         new Array(NFRETS + 1).fill(0),
-                strGlow:          new Array(nStr).fill(0.5),
+                fretHeat: new Array(NFRETS + 1).fill(0),
+                strGlow: new Array(nStr).fill(0.5),
             };
 
             // Compute sustain / anticipation / fret heat / per-string glow
             if (notes) {
                 for (const n of notes) {
                     if (!validString(n.s)) continue;
-                    const dt     = n.t - now;
+                    const dt = n.t - now;
                     const susEnd = n.t + (n.sus || 0);
                     if (dt > 0 && dt < 0.6)
                         noteState.stringAnticipation[n.s] = Math.max(noteState.stringAnticipation[n.s], 1 - dt / 0.6);
@@ -1852,7 +1631,7 @@
                     let maxSus = 0;
                     for (const n of chordNotes) if ((n.sus || 0) > maxSus) maxSus = n.sus;
                     const susEnd = ch.t + maxSus;
-                    const dt     = ch.t - now;
+                    const dt = ch.t - now;
                     for (const cn of chordNotes) {
                         if (dt > 0 && dt < 0.6)
                             noteState.stringAnticipation[cn.s] = Math.max(noteState.stringAnticipation[cn.s], 1 - dt / 0.6);
@@ -1920,8 +1699,8 @@
                     }
                     if (n.t + (n.sus || 0) < t0 || n.t > t1) continue;
                     if (!validString(n.s)) continue;
-                    const isNext      = nextNoteByString[n.s] && Math.abs(nextNoteByString[n.s].t - n.t) < 0.001;
-                    const skipLabel   = lastFretForString[n.s] === n.f;
+                    const isNext = nextNoteByString[n.s] && Math.abs(nextNoteByString[n.s].t - n.t) < 0.001;
+                    const skipLabel = lastFretForString[n.s] === n.f;
                     drawNote(n, now, undefined, isNext, skipLabel, false);
                     lastFretForString[n.s] = n.f;
                     if (n.f > 0 && n.t <= t1) { fMin = Math.min(fMin, n.f); fMax = Math.max(fMax, n.f); got = true; }
@@ -1930,7 +1709,7 @@
 
             // ── Chords ────────────────────────────────────────────────────
             if (chords) {
-                let prevChordSig  = null;
+                let prevChordSig = null;
                 let prevChordTime = -1;
 
                 for (const ch of chords) {
@@ -1958,8 +1737,8 @@
 
                     // Repeat-chord detection (consecutive same shape)
                     const currentSig = chordNotes.slice().sort((a, b) => a.s - b.s).map(n => `${n.s}:${n.f}`).join('|');
-                    const isRepeat   = prevChordSig === currentSig && Math.abs(ch.t - prevChordTime) < 0.5;
-                    prevChordSig  = currentSig;
+                    const isRepeat = prevChordSig === currentSig && Math.abs(ch.t - prevChordTime) < 0.5;
+                    prevChordSig = currentSig;
                     prevChordTime = ch.t;
 
                     // Open-string center X
@@ -1971,7 +1750,7 @@
                     if (fretted > 0) chordCX = (cxL + cxR) / 2;
 
                     for (const cn of chordNotes) {
-                        const isNext    = nextNoteByString[cn.s] && Math.abs(nextNoteByString[cn.s].t - ch.t) < 0.001;
+                        const isNext = nextNoteByString[cn.s] && Math.abs(nextNoteByString[cn.s].t - ch.t) < 0.001;
                         const skipLabel = lastFretForString[cn.s] === cn.f;
                         drawNote({ ...cn, t: ch.t, sus: cn.sus || 0 }, now, cn.f === 0 ? chordCX : undefined, isNext, skipLabel, isRepeat, 0.55);
                         lastFretForString[cn.s] = cn.f;
@@ -1985,20 +1764,20 @@
                         let fMinCh = 99, fMaxCh = 0;
                         for (const cn of chordNotes) { if (cn.f > 0) { fMinCh = Math.min(fMinCh, cn.f); fMaxCh = Math.max(fMaxCh, cn.f); } }
                         if (fMinCh < 99) {
-                            const xLeft  = fretX(fMinCh - 1);
+                            const xLeft = fretX(fMinCh - 1);
                             const xRight = fretX(Math.max(fMaxCh, fMinCh + 2));
-                            const padX   = NW * 0.4;
-                            const width  = (xRight - xLeft) + padX * 2;
-                            const cx     = xLeft + width / 2 - padX;
-                            const yA     = sY(0), yB = sY(nStr - 1);
-                            const yMinF  = Math.min(yA, yB) - S_GAP * 0.8;
-                            const yMaxF  = Math.max(yA, yB) + S_GAP * 0.8;
-                            let   height = yMaxF - yMinF;
+                            const padX = NW * 0.4;
+                            const width = (xRight - xLeft) + padX * 2;
+                            const cx = xLeft + width / 2 - padX;
+                            const yA = sY(0), yB = sY(nStr - 1);
+                            const yMinF = Math.min(yA, yB) - S_GAP * 0.8;
+                            const yMaxF = Math.max(yA, yB) + S_GAP * 0.8;
+                            let height = yMaxF - yMinF;
                             if (isRepeat) height *= 0.5;
-                            const cY     = (yMinF + yMaxF) / 2;
-                            const fade   = Math.max(0, 1 - chDt / AHEAD);
+                            const cY = (yMinF + yMaxF) / 2;
+                            const fade = Math.max(0, 1 - chDt / AHEAD);
                             const baseOp = isRepeat ? 0.05 + fade * 0.1 : 0.12 + fade * 0.2;
-                            const thick  = 0.25 * K;
+                            const thick = 0.25 * K;
                             const drawEdge = (px, py, sx, sy) => {
                                 const b = pChordBox.get(); b.position.set(px, py, z); b.scale.set(sx, sy, thick); b.material.opacity = baseOp;
                             };
@@ -2025,9 +1804,9 @@
                                     let bFret = Infinity;
                                     for (const cn of chordNotes) if (cn.f > 0) bFret = Math.min(bFret, cn.f);
                                     if (bFret < Infinity) {
-                                        const bx    = fretMid(bFret);
-                                        const yTop  = Math.max(sY(0), sY(nStr - 1));
-                                        const yBot  = Math.min(sY(0), sY(nStr - 1));
+                                        const bx = fretMid(bFret);
+                                        const yTop = Math.max(sY(0), sY(nStr - 1));
+                                        const yBot = Math.min(sY(0), sY(nStr - 1));
                                         const lineH = yTop - yBot;
                                         const postFadeB = Math.max(0, 1 + chDt / 0.55);
                                         const bl = pBarreLine.get();
@@ -2051,12 +1830,12 @@
                     dMax = dMax + (3 - (dMax - dMin));
                     if (dMax > NFRETS) { dMax = NFRETS; dMin = Math.max(0, dMax - 4); }
                 }
-                const xL     = fretX(dMin), xR = fretX(dMax);
+                const xL = fretX(dMin), xR = fretX(dMax);
                 const margin = NW * 0.5;
-                const laneW  = (xR - xL) + margin * 2;
+                const laneW = (xR - xL) + margin * 2;
                 const laneLen = TS * AHEAD;
                 const boardY = S_BASE - NH / 2 - 2 * K;
-                const lane   = pLane.get();
+                const lane = pLane.get();
                 lane.position.set((xL + xR) / 2, boardY + 0.02 * K, -laneLen / 2 + TS * BEHIND);
                 lane.rotation.x = -Math.PI / 2;
                 lane.scale.set(laneW, laneLen, 1);
@@ -2067,7 +1846,7 @@
                 // Lane dividers (fret wires inside active range)
                 if (highwayIntensity > 0.05) {
                     const divLen = TS * (AHEAD + BEHIND) * 0.6;
-                    const yPos   = boardY + 0.03 * K;
+                    const yPos = boardY + 0.03 * K;
                     for (let f = Math.floor(dMin); f <= Math.ceil(dMax); f++) {
                         const div = pLaneDivider.get();
                         div.position.set(fretX(f), yPos, dZ(0) - divLen * 0.5 + TS * BEHIND);
@@ -2082,9 +1861,9 @@
             {
                 const yBottom = Math.min(sY(0), sY(nStr - 1));
                 for (let f = 1; f <= NFRETS; f++) {
-                    const lb       = pFretLbl.get();
+                    const lb = pFretLbl.get();
                     const isActive = activeFrets.has(f);
-                    lb.material    = txtMat(f, isActive ? '#ffe84d' : '#9ab8cc', false);
+                    lb.material = txtMat(f, isActive ? '#ffe84d' : '#9ab8cc', false);
                     lb.position.set(fretMid(f), yBottom - S_GAP * 0.6, 0.5 * K);
                     const intensity = noteState.fretHeat[f];
                     lb.material.opacity = 0.35 + intensity * 0.65;
@@ -2121,7 +1900,7 @@
 
             // ── Camera target ─────────────────────────────────────────────
             if (got) {
-                tgtX   = fretMid(Math.round((fMin + fMax) / 2));
+                tgtX = fretMid(Math.round((fMin + fMax) / 2));
                 tgtDist = (65 + Math.max(fMax - fMin, 4) * 3) * K;
             }
 
@@ -2147,25 +1926,25 @@
         // skipLabel: don't draw per-note connector label (repeated fret)
         // skipBody:  don't draw the 3D note mesh (repeat chord — still shows projection)
         function drawNote(n, now, openX, isNext, skipLabel, skipBody, linger = 0.05) {
-            const s      = n.s;
+            const s = n.s;
             // Belt + suspenders: callers already gate via validString(),
             // but drawNote is also entered through { ...cn } chord-note
             // spreads, so re-check here before indexing material arrays.
             if (!validString(s)) return;
-            const dt     = n.t - now;
-            const y      = sY(s);
+            const dt = n.t - now;
+            const y = sY(s);
             const susEnd = n.t + (n.sus || 0);
             const hasSus = n.sus > 0;
             if (dt < -linger && (!hasSus || now > susEnd)) return;
 
             const sustained = dt < 0 && hasSus && now <= susEnd;
-            const hitDist   = Math.abs(dt);
-            const hit       = hitDist < 0.15 || sustained;
-            const hitFade   = sustained ? 0.7 : (hitDist < 0.15 ? 1 - hitDist / 0.15 : 0);
-            const vibrato   = sustained ? Math.sin(now * 30) * 0.3 * K : 0;
-            const noteZ     = sustained ? 0 : Math.min(0, dZ(dt));
-            const x         = n.f === 0 ? (openX !== undefined ? openX : curX) : fretMid(n.f);
-            const isHarm    = n.hm || n.hp;
+            const hitDist = Math.abs(dt);
+            const hit = hitDist < 0.15 || sustained;
+            const hitFade = sustained ? 0.7 : (hitDist < 0.15 ? 1 - hitDist / 0.15 : 0);
+            const vibrato = sustained ? Math.sin(now * 30) * 0.3 * K : 0;
+            const noteZ = sustained ? 0 : Math.min(0, dZ(dt));
+            const x = n.f === 0 ? (openX !== undefined ? openX : curX) : fretMid(n.f);
+            const isHarm = n.hm || n.hp;
 
             if (!skipBody) {
                 // Rotate from vertical (π/2) when entering to horizontal (0) at the hit line; skip for open strings
@@ -2252,11 +2031,11 @@
                 // ── Sustain trail ─────────────────────────────────────────
                 if (hasSus) {
                     const susStart = Math.max(n.t, now);
-                    const remSus   = susEnd - susStart;
+                    const remSus = susEnd - susStart;
                     if (remSus > 0.01) {
-                        const len  = Math.min(remSus, AHEAD) * TS;
+                        const len = Math.min(remSus, AHEAD) * TS;
                         const zPos = dZ(susStart - now) - len / 2;
-                        const tw   = NW * 0.85, th = NH * 0.12;
+                        const tw = NW * 0.85, th = NH * 0.12;
                         const trOut = pSusOutline.get();
                         trOut.position.set(x, y, zPos);
                         trOut.scale.set(tw + 0.4 * K, th + 0.4 * K, len);
@@ -2269,7 +2048,7 @@
 
                 // ── Lane drop line (anchors note to its lane) ─────────────
                 if (dt > 0) {
-                    const boardY  = S_BASE - NH / 2 - 2 * K;
+                    const boardY = S_BASE - NH / 2 - 2 * K;
                     const lineTop = y - NH / 2 - NH * 0.4;
                     const lineBot = boardY + NH * 0.5;
                     const lineLen = lineTop - lineBot;
@@ -2297,7 +2076,7 @@
                 // AHEAD edge. In screen space the offset stays roughly
                 // constant — labels appear anchored to the note even
                 // though the world-space distance grows.
-                const LBL_MULT  = 1.6;
+                const LBL_MULT = 1.6;
                 const distFactor = 1 + Math.max(0, Math.min(1, dt / AHEAD)) * 1.5;
                 const sLbl = LBL_MULT * distFactor;
                 let yo = y + NH * 0.8 * sLbl;
@@ -2312,9 +2091,21 @@
                     l.scale.set(NH * 1.6 * sLbl, NH * 1.6 * sLbl, 1); l.position.set(x + NW * 0.6 * sLbl, yo, noteZ);
                 }
                 if (n.ho || n.po || n.tp) {
-                    const l = pLbl.get();
-                    l.material = txtMat(n.ho ? 'H' : n.po ? 'P' : 'T', '#fff', false);
-                    l.scale.set(NH * 1.5 * sLbl, NH * 1.5 * sLbl, 1); l.position.set(x + NW * 0.6 * sLbl, yo, noteZ);
+                    if (n.ho || n.po) {
+                        const arrow = pTechArrow.get();
+                        const arrowScale = NH * 0.75 * sLbl;
+                        arrow.position.set(x, y + vibrato, noteZ + 1.1 * K);
+                        arrow.rotation.z = (isHarm ? Math.PI / 4 : 0);
+                        arrow.scale.set(arrowScale, n.ho ? -arrowScale : arrowScale, 1);
+                        arrow.renderOrder = 2;
+                    } else {
+                        const chevron = pTapChevron.get();
+                        const chevronScale = NH * 0.8 * sLbl; // Aumentado ligeramente para legibilidad
+                        chevron.position.set(x, y + vibrato, noteZ + 1.1 * K);
+                        chevron.rotation.z = (isHarm ? Math.PI / 4 : 0);
+                        chevron.scale.set(chevronScale, chevronScale, 1);
+                        chevron.renderOrder = 2;
+                    }
                 }
                 if (n.ac) {
                     const l = pLbl.get();
@@ -2350,12 +2141,12 @@
                 // ── Per-note fret connector label ─────────────────────────
                 if (n.f > 0 && !skipLabel) {
                     const minStringY = Math.min(sY(0), sY(nStr - 1));
-                    const labelY     = minStringY - S_GAP * 0.8;
+                    const labelY = minStringY - S_GAP * 0.8;
                     // fade out in the last 0.5 s so it doesn't overlap the fret-row label at Z=0
-                    const alpha      = Math.max(0, Math.min(1, dt / 0.5)) * Math.min(1, (AHEAD - dt) / (AHEAD * 0.4));
+                    const alpha = Math.max(0, Math.min(1, dt / 0.5)) * Math.min(1, (AHEAD - dt) / (AHEAD * 0.4));
 
-                    const fretLabel  = pNoteFretLabel.get();
-                    const cachedMat  = txtMat(n.f, '#ffffff', false);
+                    const fretLabel = pNoteFretLabel.get();
+                    const cachedMat = txtMat(n.f, '#ffffff', false);
                     if (fretLabel.material.map !== cachedMat.map) {
                         fretLabel.material.map = cachedMat.map;
                         fretLabel.material.needsUpdate = true;
@@ -2372,9 +2163,9 @@
             }
 
             // ── Board projection (ghost at Z=0, always drawn for isNext) ─
-            const PROJ_WIN   = 0.6;
+            const PROJ_WIN = 0.6;
             const projFactor = Math.max(0, Math.min(1, 1 - dt / PROJ_WIN));
-            const isBlocked  = dt < 0.15 && n.sus > 0;
+            const isBlocked = dt < 0.15 && n.sus > 0;
             if (n.f > 0 && isNext && dt > 0 && dt < PROJ_WIN && projFactor > 0.05 && !isBlocked) {
                 const proj = projMeshArr[s];
                 proj.material.opacity = (skipBody ? 0.1 : 0.15) + projFactor * 0.6;
@@ -2394,12 +2185,12 @@
 
         /* ── Camera smooth lerp ──────────────────────────────────────────── */
         function camUpdate(bundle) {
-            const bpm  = computeBPM(bundle.beats, bundle.currentTime);
+            const bpm = computeBPM(bundle.beats, bundle.currentTime);
             const lerp = CAM_LERP_BASE * Math.max(bpm, 60) / 120;
-            curX    += (tgtX    - curX)    * lerp;
+            curX += (tgtX - curX) * lerp;
             curDist += (tgtDist - curDist) * lerp;
             const dist = curDist * aspectScale;
-            const h    = CAM_H_BASE * (dist / CAM_DIST_BASE);
+            const h = CAM_H_BASE * (dist / CAM_DIST_BASE);
             cam.position.set(curX + 20 * K, h * 0.95, dist * 0.75);
 
             // Self-correcting look-at Y: project the fretboard's near-edge centre
@@ -2450,7 +2241,7 @@
             // panel that stops doesn't keep accumulating marks. Marks
             // arrays are cleared too — they hold stale chart positions
             // that next init() may reuse (drawNote keys on (s, f, t)).
-            if (_ndOnHit)  { window.removeEventListener('notedetect:hit',  _ndOnHit);  _ndOnHit  = null; }
+            if (_ndOnHit) { window.removeEventListener('notedetect:hit', _ndOnHit); _ndOnHit = null; }
             if (_ndOnMiss) { window.removeEventListener('notedetect:miss', _ndOnMiss); _ndOnMiss = null; }
             _ndHitMarks = [];
             _ndMissMarks = [];
@@ -2476,11 +2267,11 @@
                     }
                 });
             }
-            gNote?.dispose?.(); gSus?.dispose?.(); gBeat?.dispose?.();
-            for (const m of mStr)     m?.dispose?.();
-            for (const m of mGlow)    m?.dispose?.();
-            for (const m of mSus)     m?.dispose?.();
-            for (const m of mProj)    m?.dispose?.();
+            gNote?.dispose?.(); gSus?.dispose?.(); gBeat?.dispose?.(); gTechArrow?.dispose?.(); gTapChevron?.dispose?.();
+            for (const m of mStr) m?.dispose?.();
+            for (const m of mGlow) m?.dispose?.();
+            for (const m of mSus) m?.dispose?.();
+            for (const m of mProj) m?.dispose?.();
             for (const m of mProjGlow) m?.dispose?.();
             mBeatM?.dispose?.(); mBeatQ?.dispose?.();
             // Notedetect outline materials (#9). May not be reachable
@@ -2506,8 +2297,8 @@
             _renderScale = 1;
             mBeatM = mBeatQ = null;
             pNote = pSus = pSusOutline = pLbl = pBeat = pSec = null;
-            pFretLbl = pLane = pLaneDivider = pChordBox = pChordLbl = pBarreLine = pNoteFretLabel = pConnectorLine = pDropLine = null;
-            gNote = gSus = gBeat = null;
+            pFretLbl = pLane = pLaneDivider = pChordBox = pChordLbl = pBarreLine = pNoteFretLabel = pConnectorLine = pDropLine = pTechArrow = pTapChevron = null;
+            gNote = gSus = gBeat = gTechArrow = gTapChevron = null;
             tgtX = curX = 0; tgtDist = curDist = CAM_DIST_BASE; tgtLookY = curLookY = 0; nStr = NSTR; _oobStringWarned = false;
         }
 
@@ -2535,9 +2326,9 @@
                 _destroyed = _isReady = false;
                 _isFocused = true;
                 const myToken = ++_initToken;
-                highwayCanvas      = canvas;
-                _invertedCached    = !!(bundle && bundle.inverted);
-                _renderScale       = (bundle && bundle.renderScale) || 1;
+                highwayCanvas = canvas;
+                _invertedCached = !!(bundle && bundle.inverted);
+                _renderScale = (bundle && bundle.renderScale) || 1;
 
                 if (_ssActive()) {
                     window.slopsmithSplitscreen.onFocusChange(_onFocusChange);
@@ -2583,7 +2374,7 @@
             draw(bundle) {
                 if (!_isReady) return;
                 _invertedCached = !!bundle.inverted;
-                const newNStr  = resolveStringCount(bundle);
+                const newNStr = resolveStringCount(bundle);
                 const newScale = bundle.renderScale || 1;
                 if (_invertedCached !== _invertedForBoard || newNStr !== nStr) {
                     if (newNStr !== nStr) _oobStringWarned = false;
