@@ -434,6 +434,76 @@
         return c;
     }
 
+    // Helpers shared by the asset-driven bg styles (image, video).
+    // Both render a "stage backdrop" plane that's full-bleed: sized
+    // each frame to fill the camera's view frustum at a fixed
+    // distance and positioned to track the camera (so the user's
+    // image/video reads as the entire visible BG, with highway and
+    // notes painting on top via renderOrder).
+    //
+    // Distance is chosen far enough back that no note ever lands
+    // beyond it; depthWrite=false on the plane material plus
+    // renderOrder=-1 means notes still paint on top regardless.
+    const BG_BACKDROP_DISTANCE = FOG_END * 0.95;
+
+    // Module-level scratch vector reused each frame to avoid GC
+    // churn from per-frame Vector3 allocation. Only valid for the
+    // duration of a single update() call.
+    const _bgBackdropTmp = (() => {
+        // Lazily created when T is available (T isn't bound at module
+        // parse time — initScene assigns it inside loadThree().then).
+        // Returning a getter that allocates on first read keeps the
+        // dependency timing clean.
+        let v = null;
+        return () => v || (v = new T.Vector3());
+    })();
+
+    // Frustum-fit a plane mesh: scale a unit PlaneGeometry to exactly
+    // fill the camera's view at the configured distance, then position
+    // it `distance` units in front of the camera and orient it so the
+    // texture faces the camera. Called whenever cam.aspect changes
+    // (resize) and to position-track the camera each frame.
+    function _bgFitBackdropPlane(state) {
+        const cam = state.cam;
+        const d = state.distance;
+        const halfFovRad = cam.fov * Math.PI / 360;
+        const visibleHeight = 2 * Math.tan(halfFovRad) * d;
+        const visibleWidth = visibleHeight * cam.aspect;
+        if (state.lastAspect !== cam.aspect ||
+            state.lastVisibleHeight !== visibleHeight) {
+            state.mesh.scale.set(visibleWidth, visibleHeight, 1);
+            state.lastAspect = cam.aspect;
+            state.lastVisibleHeight = visibleHeight;
+            // Aspect change shifts the cover-crop ratio; re-apply.
+            if (state.applyCoverCrop) state.applyCoverCrop();
+        }
+        // Track camera each frame: position = cam.position +
+        // cam.forward * distance, orient toward camera.
+        const fwd = cam.getWorldDirection(_bgBackdropTmp());
+        state.mesh.position.copy(cam.position).addScaledVector(fwd, d);
+        state.mesh.lookAt(cam.position);
+    }
+
+    // Cover-crop a texture to the plane aspect: the larger axis fills
+    // the plane (cropped if needed), centered. For wider-than-plane
+    // textures the X offset is left at the centered value but the
+    // image style's drift loop overwrites it per frame; the video
+    // style leaves it centered.
+    function _bgCoverCrop(tex, srcW, srcH, planeAspect) {
+        if (srcW <= 0 || srcH <= 0) return;
+        tex.repeat.set(1, 1);
+        tex.offset.set(0, 0);
+        const srcAspect = srcW / srcH;
+        if (srcAspect > planeAspect) {
+            tex.repeat.x = planeAspect / srcAspect;
+            tex.offset.x = (1 - tex.repeat.x) * 0.5;
+        } else {
+            tex.repeat.y = srcAspect / planeAspect;
+            tex.offset.y = (1 - tex.repeat.y) * 0.5;
+        }
+        tex.needsUpdate = true;
+    }
+
     // Background-style registry. Each entry returns a per-panel state
     // object from build() and reads from it in update() / teardown().
     // T (THREE) is set by the time these are invoked (initScene runs
@@ -718,8 +788,6 @@
                 // values as "no asset" — style is inert, user can
                 // clear and re-upload from settings.
                 if (dataUrl.length > 2.5 * 1024 * 1024) return null;
-                const planeW = 400 * K, planeH = 120 * K;
-                const planeAspect = planeW / planeH;
                 // Renderer-side decompression-bomb caps. Mirror
                 // settings.html's upload-time guard so a manual
                 // localStorage edit (or legacy data from before that
@@ -727,15 +795,28 @@
                 // and OOM the GPU on texture upload.
                 const MAX_IMAGE_DIM = 4096;
                 const MAX_IMAGE_PIXELS = 16 * 1024 * 1024;
-                // Build the state object upfront so async TextureLoader
-                // callbacks can write back into it (loaded flag, mesh
-                // visibility, drift reset). update() reads s.loaded
-                // before advancing drift, which keeps the initial
-                // texture offset deterministic regardless of how long
-                // the async decode takes.
+                // Full-bleed backdrop: unit plane, scaled per frame in
+                // _bgFitBackdropPlane to fill the camera's view at
+                // BG_BACKDROP_DISTANCE. fog: false so the backdrop
+                // shows in full color; notes drawn on top still pick
+                // up atmospheric fog as before.
                 const state = {
                     mesh: null, geo: null, mat: null, tex: null,
                     drift: 0.5, intensity: settings.intensity, loaded: false,
+                    cam: settings.cam, distance: BG_BACKDROP_DISTANCE,
+                    lastAspect: 0, lastVisibleHeight: 0,
+                };
+                // Helper closure for cover-crop refresh — called both
+                // on async decode (initial) and from _bgFitBackdropPlane
+                // when the camera aspect changes (resize).
+                state.applyCoverCrop = function () {
+                    if (!state.tex || !state.tex.image) return;
+                    _bgCoverCrop(
+                        state.tex,
+                        state.tex.image.width  || 0,
+                        state.tex.image.height || 0,
+                        state.cam.aspect,
+                    );
                 };
                 const tex = new T.TextureLoader().load(
                     dataUrl,
@@ -755,21 +836,7 @@
                             loaded.dispose();
                             return;
                         }
-                        // Cover-crop: smaller repeat = more zoom on the
-                        // image (shows a fraction of the texture
-                        // stretched across the plane), which is the right
-                        // tool for "fill plane, crop overflow".
-                        if (imgW > 0 && imgH > 0) {
-                            const imgAspect = imgW / imgH;
-                            if (imgAspect > planeAspect) {
-                                loaded.repeat.x = planeAspect / imgAspect;
-                                loaded.offset.x = (1 - loaded.repeat.x) * 0.5;
-                            } else {
-                                loaded.repeat.y = imgAspect / planeAspect;
-                                loaded.offset.y = (1 - loaded.repeat.y) * 0.5;
-                            }
-                            loaded.needsUpdate = true;
-                        }
+                        state.applyCoverCrop();
                         // Reset drift to the centered triangle-wave
                         // phase now that repeat.x is final. Without
                         // this reset, drift accumulated during the
@@ -805,28 +872,28 @@
                 tex.generateMipmaps = false;
                 tex.minFilter = T.LinearFilter;
                 tex.magFilter = T.LinearFilter;
-                const geo = new T.PlaneGeometry(planeW, planeH);
+                const geo = new T.PlaneGeometry(1, 1);
                 const mat = new T.MeshBasicMaterial({
-                    map: tex, transparent: false, depthWrite: false, fog: true,
+                    map: tex, transparent: false, depthWrite: false, fog: false,
                 });
                 const mesh = new T.Mesh(geo, mat);
-                // z = -FOG_END * 0.7 matches silhouette layer 2 (-0.70)
-                // so the image reads as part of the same parallax band.
-                // The image and silhouette styles are mutually exclusive
-                // (only one bg style mounts at a time), so co-planarity
-                // is fine — no z-fighting risk. y = 5*K lifts it
-                // slightly so the plane center aligns with the upper
-                // fog band (silhouettes sit at y = -10*K).
-                mesh.position.set(0, 5 * K, -FOG_END * 0.7);
                 scene.add(mesh);
                 state.mesh = mesh;
                 state.geo  = geo;
                 state.mat  = mat;
                 state.tex  = tex;
+                // Initial fit so the first frame is correctly sized
+                // and positioned, even if update() hasn't run yet.
+                _bgFitBackdropPlane(state);
                 return state;
             },
             update(s, bands, dt) {
                 if (!s) return;
+                // Track camera position / aspect every frame. The
+                // helper resizes the plane and refreshes cover-crop
+                // when aspect changes, and re-positions the plane to
+                // stay BG_BACKDROP_DISTANCE in front of the camera.
+                _bgFitBackdropPlane(s);
                 // Skip drift advance until the texture has finished
                 // decoding. Without this guard, drift accumulates
                 // during the async load while repeat.x is still 1
@@ -891,8 +958,6 @@
                 // 404 endpoint.
                 if (!/^current\.(mp4|webm)$/.test(filename)) return null;
                 const url = '/api/plugins/highway_3d/files/' + filename;
-                const planeW = 400 * K, planeH = 120 * K;
-                const planeAspect = planeW / planeH;
 
                 // Track partial allocations so a throw between any of
                 // them can clean up. _bgMountStyle's failure path
@@ -944,44 +1009,38 @@
                     tex.minFilter = T.LinearFilter;
                     tex.magFilter = T.LinearFilter;
                     tex.generateMipmaps = false;
-                    geo = new T.PlaneGeometry(planeW, planeH);
+                    geo = new T.PlaneGeometry(1, 1);
                     mat = new T.MeshBasicMaterial({
-                        map: tex, transparent: false, depthWrite: false, fog: true,
+                        map: tex, transparent: false, depthWrite: false, fog: false,
                     });
                     mesh = new T.Mesh(geo, mat);
-                    // Same z as the image style — silhouette layer 2's
-                    // parallax band. Image and video are mutually
-                    // exclusive (one bg style mounts at a time), so
-                    // co-planarity is harmless.
-                    mesh.position.set(0, 5 * K, -FOG_END * 0.7);
                     scene.add(mesh);
 
-                    // No `loaded` / `intensity` here — unlike the image
-                    // style, video's update() is empty (VideoTexture
-                    // auto-updates each frame from the playing
-                    // element) so there's no per-frame state to gate
-                    // or scale.
-                    const state = { videoEl, mesh, geo, mat, tex };
+                    // Full-bleed backdrop: scaled and positioned each
+                    // frame in update() via _bgFitBackdropPlane.
+                    // cam + distance + lastAspect / lastVisibleHeight
+                    // power that helper.
+                    const state = {
+                        videoEl, mesh, geo, mat, tex,
+                        cam: settings.cam, distance: BG_BACKDROP_DISTANCE,
+                        lastAspect: 0, lastVisibleHeight: 0,
+                    };
+                    state.applyCoverCrop = function () {
+                        if (!state.videoEl) return;
+                        _bgCoverCrop(
+                            state.tex,
+                            state.videoEl.videoWidth  || 0,
+                            state.videoEl.videoHeight || 0,
+                            state.cam.aspect,
+                        );
+                    };
 
                     // Cover-crop math runs on loadedmetadata since
-                    // video dimensions aren't known until then. Same
-                    // precedence as the image style: wider-than-plane
-                    // → crop sides; taller → crop top/bottom;
-                    // centered offset.
+                    // video dimensions aren't known until then.
+                    // _bgFitBackdropPlane will also re-apply when the
+                    // camera aspect changes.
                     videoEl.addEventListener('loadedmetadata', () => {
-                        const vw = videoEl.videoWidth  || 0;
-                        const vh = videoEl.videoHeight || 0;
-                        if (vw > 0 && vh > 0) {
-                            const vAspect = vw / vh;
-                            if (vAspect > planeAspect) {
-                                state.tex.repeat.x = planeAspect / vAspect;
-                                state.tex.offset.x = (1 - state.tex.repeat.x) * 0.5;
-                            } else {
-                                state.tex.repeat.y = vAspect / planeAspect;
-                                state.tex.offset.y = (1 - state.tex.repeat.y) * 0.5;
-                            }
-                            state.tex.needsUpdate = true;
-                        }
+                        state.applyCoverCrop();
                     });
                     videoEl.addEventListener('error', () => {
                         // Fired for: codec unsupported, 404 from
@@ -1011,6 +1070,9 @@
                     videoEl.play().catch((err) => {
                         console.warn('[3D-Hwy] custom video play() rejected (will retry on visibility/gesture)', err);
                     });
+                    // Initial fit so the first frame is correctly
+                    // sized and positioned even before update() runs.
+                    _bgFitBackdropPlane(state);
                     return state;
                 } catch (err) {
                     // Best-effort cleanup of whatever was allocated
@@ -1033,13 +1095,17 @@
                     throw err;
                 }
             },
-            update() {
+            update(s) {
+                if (!s) return;
                 // VideoTexture auto-updates from the playing element —
                 // Three.js samples the current frame each render. No
-                // per-frame mutation here. Drift on offset.x is
-                // intentionally omitted: the video's own motion is
+                // per-frame texture mutation here. Drift on offset.x
+                // is intentionally omitted: the video's own motion is
                 // the "life", drifting the crop on top would feel
-                // busy and compete with playback.
+                // busy and compete with playback. The only per-frame
+                // work is keeping the plane camera-locked and resized
+                // when aspect changes (handled inside the helper).
+                _bgFitBackdropPlane(s);
             },
             teardown(s) {
                 if (!s) return;
@@ -1845,6 +1911,7 @@
                     palette: activePalette,
                     customImageDataUrl: bgCustomImageDataUrl,
                     customVideoName: bgCustomVideoName,
+                    cam: cam,
                 }) || null;
             } catch (e) {
                 console.error('[3D-Hwy] bg style build failed', bgStyleId, e);
