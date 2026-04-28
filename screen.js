@@ -1689,10 +1689,10 @@
                     color: 0xd4d4d4,
                     emissive: 0xd4d4d4,
                     emissiveIntensity: 0.9,
-                    transparent: false,
+                    transparent: true,
                     opacity: 0.85,
                     side: T.DoubleSide,
-                    depthWrite: true,
+                    depthWrite: false,
                 }));
             });
             pLbl = pool(lblG, () => new T.Sprite(txtMat('0', '#fff', false)));
