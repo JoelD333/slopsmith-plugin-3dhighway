@@ -283,8 +283,8 @@
         return _bgBandsCache;
     }
 
-    const BG_DEFAULTS = { style: 'particles', intensity: 0.5, reactive: true, palette: 'default', showFretOnNote: false, customImageDataUrl: '', customImageName: '' };
-    const BG_STYLE_IDS = ['off', 'particles', 'silhouettes', 'lights', 'geometric', 'image'];
+    const BG_DEFAULTS = { style: 'particles', intensity: 0.5, reactive: true, palette: 'default', showFretOnNote: false, customImageDataUrl: '', customImageName: '', customVideoName: '' };
+    const BG_STYLE_IDS = ['off', 'particles', 'silhouettes', 'lights', 'geometric', 'image', 'video'];
 
     function _bgPanelKey(canvas) {
         const ss = window.slopsmithSplitscreen;
@@ -389,6 +389,16 @@
         _bgWriteGlobal('customImageDataUrl', '');
         _bgWriteGlobal('customImageName', '');
     };
+    // Custom video asset for the 'video' bg style (#19 follow-up).
+    // Bytes live on disk under {config_dir}/plugin_uploads/highway_3d/
+    // and are served by routes.py — localStorage only stores the
+    // filename, which the renderer maps to the served URL. Single
+    // global slot; the file picker in settings.html POSTs to the
+    // upload route and then calls this setter with the response name.
+    window.h3dBgSetCustomVideo = (asset) => {
+        _bgWriteGlobal('customVideoName', (asset && asset.name) || '');
+    };
+    window.h3dBgClearCustomVideo = () => _bgWriteGlobal('customVideoName', '');
     // Back-compat alias for any caller that picked up the original
     // (inconsistent) name during this PR's review window.
     window.h3dSetPalette     = window.h3dBgSetPalette;
@@ -855,6 +865,198 @@
                 s.tex.dispose();
             },
         },
+        // Custom video backdrop (#19 follow-up). User uploads a
+        // .mp4/.webm via settings.html; routes.py stores it on disk and
+        // serves a same-origin URL (avoids CORS taint on VideoTexture).
+        // localStorage holds only the filename — bytes live in
+        // {config_dir}/plugin_uploads/highway_3d/. Per-panel video
+        // element so each panel can mount/teardown independently;
+        // browsers cache the video bytes after first fetch so multi-
+        // panel splitscreen pays only the decoder cost, not the
+        // network or disk-read cost.
+        video: {
+            build(scene, settings) {
+                // Lowercase before validation so a manual localStorage
+                // edit like `current.MP4` doesn't pass a case-insensitive
+                // regex check and then 404 against the server, which
+                // only ever produces and serves lowercase
+                // current.<ext> (the upload route lowercases the
+                // extension; routes.py's GET pattern is case-sensitive).
+                const filename = (typeof settings.customVideoName === 'string')
+                    ? settings.customVideoName.trim().toLowerCase() : '';
+                // Strict pattern matches routes.py's deterministic
+                // single-slot naming. Any other shape (corrupt
+                // localStorage, future schema change) → style is
+                // inert, no <video> created, no orphan request to a
+                // 404 endpoint.
+                if (!/^current\.(mp4|webm)$/.test(filename)) return null;
+                const url = '/api/plugins/highway_3d/files/' + filename;
+                const planeW = 400 * K, planeH = 120 * K;
+                const planeAspect = planeW / planeH;
+
+                // Track partial allocations so a throw between any of
+                // them can clean up. _bgMountStyle's failure path
+                // disposes the stage tree but explicitly does NOT
+                // dispose textures (per the comment at
+                // _bgDisposeGroupTree), and the <video> element is
+                // parented to document.body — not the stage — so
+                // neither would be reached without an explicit catch.
+                let videoEl = null, tex = null, geo = null, mat = null, mesh = null;
+                try {
+                    // muted + playsInline + autoplay is the cross-
+                    // browser recipe that bypasses gesture requirements
+                    // (Chrome, Firefox, Safari desktop + mobile).
+                    // preload='auto' lets the first frame land before
+                    // play() is called. src is deliberately NOT set
+                    // yet — we want every piece of state (mesh, tex)
+                    // to exist before the browser can fire
+                    // loadedmetadata or error events on a cached
+                    // resource. The handlers close over state.tex /
+                    // state.mesh; setting src first would create a
+                    // window where a fast cache hit could fire an
+                    // event into half-initialized state.
+                    videoEl = document.createElement('video');
+                    // No crossOrigin attribute: the URL is same-origin
+                    // (/api/plugins/highway_3d/files/…), so VideoTexture
+                    // never sees a tainted canvas. Setting
+                    // `crossOrigin = "anonymous"` would also strip
+                    // cookies from the fetch, which would 401 against
+                    // any cookie-protected slopsmith deployment. If
+                    // this ever needs to fetch cross-origin, switch
+                    // to `use-credentials` AND have the server send
+                    // the matching CORS headers.
+                    videoEl.muted = true;
+                    videoEl.playsInline = true;
+                    videoEl.loop = true;
+                    videoEl.autoplay = true;
+                    videoEl.preload = 'auto';
+                    videoEl.style.display = 'none';
+                    document.body.appendChild(videoEl);
+
+                    // Build mesh + texture before registering listeners
+                    // and before setting src. By the time loadedmetadata
+                    // or error can fire, state.tex and state.mesh are
+                    // both populated.
+                    tex = new T.VideoTexture(videoEl);
+                    tex.colorSpace = T.SRGBColorSpace;
+                    tex.wrapS = T.ClampToEdgeWrapping;
+                    tex.wrapT = T.ClampToEdgeWrapping;
+                    tex.minFilter = T.LinearFilter;
+                    tex.magFilter = T.LinearFilter;
+                    tex.generateMipmaps = false;
+                    geo = new T.PlaneGeometry(planeW, planeH);
+                    mat = new T.MeshBasicMaterial({
+                        map: tex, transparent: false, depthWrite: false, fog: true,
+                    });
+                    mesh = new T.Mesh(geo, mat);
+                    // Same z as the image style — silhouette layer 2's
+                    // parallax band. Image and video are mutually
+                    // exclusive (one bg style mounts at a time), so
+                    // co-planarity is harmless.
+                    mesh.position.set(0, 5 * K, -FOG_END * 0.7);
+                    scene.add(mesh);
+
+                    // No `loaded` / `intensity` here — unlike the image
+                    // style, video's update() is empty (VideoTexture
+                    // auto-updates each frame from the playing
+                    // element) so there's no per-frame state to gate
+                    // or scale.
+                    const state = { videoEl, mesh, geo, mat, tex };
+
+                    // Cover-crop math runs on loadedmetadata since
+                    // video dimensions aren't known until then. Same
+                    // precedence as the image style: wider-than-plane
+                    // → crop sides; taller → crop top/bottom;
+                    // centered offset.
+                    videoEl.addEventListener('loadedmetadata', () => {
+                        const vw = videoEl.videoWidth  || 0;
+                        const vh = videoEl.videoHeight || 0;
+                        if (vw > 0 && vh > 0) {
+                            const vAspect = vw / vh;
+                            if (vAspect > planeAspect) {
+                                state.tex.repeat.x = planeAspect / vAspect;
+                                state.tex.offset.x = (1 - state.tex.repeat.x) * 0.5;
+                            } else {
+                                state.tex.repeat.y = vAspect / planeAspect;
+                                state.tex.offset.y = (1 - state.tex.repeat.y) * 0.5;
+                            }
+                            state.tex.needsUpdate = true;
+                        }
+                    });
+                    videoEl.addEventListener('error', () => {
+                        // Fired for: codec unsupported, 404 from
+                        // server, truncated file, etc. Hide the mesh
+                        // so we don't paint a frozen blank plane on
+                        // top of fog.
+                        console.error('[3D-Hwy] custom video load failed', videoEl.error);
+                        state.mesh.visible = false;
+                    });
+
+                    // Set src last — this is what triggers the async
+                    // load. With handlers and state in place, any
+                    // synchronous-feeling event from a cached resource
+                    // is still safely received and handled.
+                    videoEl.src = url;
+
+                    // play() can reject for transient reasons (tab
+                    // backgrounded at mount time, low-power mode,
+                    // brief autoplay-policy timing window) even with
+                    // muted + autoplay set — but the browser retries
+                    // on its own once conditions improve (visibility
+                    // change, foregrounding, gesture). Real load /
+                    // codec failures come through the `error` event
+                    // we registered above and DO hide the mesh. So
+                    // just log here and leave the mesh visible; the
+                    // next ready frame will paint.
+                    videoEl.play().catch((err) => {
+                        console.warn('[3D-Hwy] custom video play() rejected (will retry on visibility/gesture)', err);
+                    });
+                    return state;
+                } catch (err) {
+                    // Best-effort cleanup of whatever was allocated
+                    // before the throw. Each step is independently
+                    // guarded so a secondary failure (e.g. dispose
+                    // throwing on an already-disposed object) can't
+                    // mask the original error.
+                    try {
+                        if (videoEl) {
+                            videoEl.pause();
+                            videoEl.removeAttribute('src');
+                            videoEl.load();
+                            if (videoEl.parentNode) videoEl.parentNode.removeChild(videoEl);
+                        }
+                    } catch (_) { /* ignore */ }
+                    try { if (mesh && mesh.parent) mesh.parent.remove(mesh); } catch (_) { /* ignore */ }
+                    try { if (geo) geo.dispose(); } catch (_) { /* ignore */ }
+                    try { if (mat) mat.dispose(); } catch (_) { /* ignore */ }
+                    try { if (tex) tex.dispose(); } catch (_) { /* ignore */ }
+                    throw err;
+                }
+            },
+            update() {
+                // VideoTexture auto-updates from the playing element —
+                // Three.js samples the current frame each render. No
+                // per-frame mutation here. Drift on offset.x is
+                // intentionally omitted: the video's own motion is
+                // the "life", drifting the crop on top would feel
+                // busy and compete with playback.
+            },
+            teardown(s) {
+                if (!s) return;
+                if (s.videoEl) {
+                    try { s.videoEl.pause(); } catch (_) {}
+                    s.videoEl.removeAttribute('src');
+                    // load() with no src tells the browser to release
+                    // any decoder/buffer state for this element.
+                    try { s.videoEl.load(); } catch (_) {}
+                    if (s.videoEl.parentNode) s.videoEl.parentNode.removeChild(s.videoEl);
+                }
+                if (s.mesh) s.mesh.parent && s.mesh.parent.remove(s.mesh);
+                if (s.geo) s.geo.dispose();
+                if (s.mat) s.mat.dispose();
+                if (s.tex) s.tex.dispose();
+            },
+        },
     };
 
     /* ======================================================================
@@ -920,6 +1122,11 @@
         // metadata that settings.html shows next to the file picker.
         let bgCustomImageDataUrl = '';
         let bgCustomImageName = '';
+        // Custom video asset (issue #19 follow-up). Stores the
+        // server-side filename only; bytes live on disk via routes.py.
+        // The renderer composes the served URL from this filename in
+        // BG_STYLES.video.build.
+        let bgCustomVideoName = '';
         let _bgListener = null;
         let _bgLastT = 0;  // ms timestamp for dt
 
@@ -1461,6 +1668,15 @@
                     _bgLoadSettings();
                     return;
                 }
+                if (changedKey === 'customVideoName') {
+                    // Filename change → new <video> source. Rebuild
+                    // only when the video style is currently active;
+                    // otherwise the new bytes pick up next time the
+                    // user picks `video`.
+                    _bgLoadSettings();
+                    if (bgStyleId === 'video') _bgRebuild();
+                    return;
+                }
                 if (changedKey === 'intensity') {
                     _bgLoadSettings();
                     // Image style reads s.intensity per frame inside
@@ -1567,6 +1783,16 @@
                 bgCustomImageDataUrl = (memDataUrl !== undefined) ? memDataUrl : BG_DEFAULTS.customImageDataUrl;
                 bgCustomImageName    = (memName    !== undefined) ? memName    : BG_DEFAULTS.customImageName;
             }
+            // Custom video filename: also a single global slot, same
+            // mem-first precedence as the image keys (a quota-failed
+            // setItem leaves _bgMemFallback ahead of localStorage).
+            const memVideoName = _bgMemFallback.customVideoName;
+            try {
+                const gVideoName = (memVideoName !== undefined) ? memVideoName : localStorage.getItem('h3d_bg_customVideoName');
+                bgCustomVideoName = (gVideoName != null) ? gVideoName : BG_DEFAULTS.customVideoName;
+            } catch (_) {
+                bgCustomVideoName = (memVideoName !== undefined) ? memVideoName : BG_DEFAULTS.customVideoName;
+            }
         }
         // Live-swap palette by mutating existing materials in place.
         // Three.js colors propagate to all sharing meshes on the next
@@ -1618,6 +1844,7 @@
                     intensity: bgIntensity,
                     palette: activePalette,
                     customImageDataUrl: bgCustomImageDataUrl,
+                    customVideoName: bgCustomVideoName,
                 }) || null;
             } catch (e) {
                 console.error('[3D-Hwy] bg style build failed', bgStyleId, e);

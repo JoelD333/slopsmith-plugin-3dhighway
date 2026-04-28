@@ -38,6 +38,7 @@
             <option value="lights">Lights (stage glows)</option>
             <option value="geometric">Geometric (rotating shapes)</option>
             <option value="image" disabled>Custom image (none uploaded)</option>
+            <option value="video" disabled>Custom video (none uploaded)</option>
         </select>
     </div>
 
@@ -84,6 +85,30 @@
         <p id="h3d-bg-custom-image-name" class="text-xs text-gray-500 mt-1"></p>
         <p id="h3d-bg-custom-image-error" class="text-xs text-red-400 mt-1 hidden"></p>
     </div>
+
+    <!-- Custom video upload (#19 follow-up). Bytes live on disk via
+         the plugin's routes.py upload route; localStorage holds only
+         the server-side filename (h3d_bg_customVideoName). Renders as
+         the `video` bg style; the picker option above auto-enables
+         once an asset is uploaded. -->
+    <div class="mt-3">
+        <label for="h3d-bg-custom-video-file" class="text-xs font-medium text-gray-400 mb-1 block">Custom video</label>
+        <p class="text-xs text-gray-500 mb-2">
+            Upload an MP4 or WebM (&le;50&nbsp;MB). Plays muted, looped
+            in the fog band when the style above is set to
+            <em>Custom video</em>. Bytes stay on the slopsmith server,
+            not in the browser.
+        </p>
+        <div class="flex items-center gap-2">
+            <input type="file" id="h3d-bg-custom-video-file"
+                   accept="video/mp4,video/webm"
+                   class="text-xs text-gray-300 file:mr-2 file:px-2 file:py-1 file:rounded file:border-0 file:bg-dark-600 file:text-gray-300">
+            <button type="button" id="h3d-bg-custom-video-clear"
+                    class="text-xs px-2 py-1 rounded bg-dark-700 border border-gray-800 text-gray-400 hover:text-gray-200">Clear</button>
+        </div>
+        <p id="h3d-bg-custom-video-name" class="text-xs text-gray-500 mt-1"></p>
+        <p id="h3d-bg-custom-video-error" class="text-xs text-red-400 mt-1 hidden"></p>
+    </div>
 </div>
 
 <div role="group" aria-labelledby="h3d-notes-heading" class="mt-6">
@@ -110,8 +135,8 @@
          no-selection / NaN state. -->
     <script>
         (function () {
-            const DEFAULTS = { style: 'particles', intensity: 0.5, reactive: true, palette: 'default', showFretOnNote: false, customImageDataUrl: '', customImageName: '' };
-            const VALID_STYLES = new Set(['off', 'particles', 'silhouettes', 'lights', 'geometric', 'image']);
+            const DEFAULTS = { style: 'particles', intensity: 0.5, reactive: true, palette: 'default', showFretOnNote: false, customImageDataUrl: '', customImageName: '', customVideoName: '' };
+            const VALID_STYLES = new Set(['off', 'particles', 'silhouettes', 'lights', 'geometric', 'image', 'video']);
             const VALID_PALETTES = new Set(['default', 'neon', 'pastel']);
             // Custom images are persisted as base64 data URLs in
             // localStorage. base64 expands the byte count by ~4/3, and
@@ -147,6 +172,22 @@
             const MAX_IMAGE_DIM = 4096;
             const MAX_IMAGE_PIXELS = 16 * 1024 * 1024;
 
+            // Video uploads go to disk via routes.py — no localStorage
+            // expansion to worry about, so the cap is just "what's
+            // reasonable for a backdrop loop" (a 50 MB MP4 covers ~30
+            // seconds at 1080p, plenty for a stage backdrop).
+            const MAX_VIDEO_BYTES = 50 * 1024 * 1024;
+            const ALLOWED_VIDEO_MIMES = new Set(['video/mp4', 'video/webm']);
+            // Server-side filenames are deterministic single-slot
+            // (current.<ext>); this pattern matches what routes.py
+            // produces and what screen.js's video style validates.
+            // Case-sensitive: routes.py only ever produces lowercase
+            // (it lowercases the upload extension) and only serves
+            // lowercase. Callers are responsible for lowercasing the
+            // candidate name before testing.
+            const VIDEO_FILENAME_RE = /^current\.(mp4|webm)$/;
+            const VIDEO_UPLOAD_URL = '/api/plugins/highway_3d/files';
+
             function coerceStyle(v) { return VALID_STYLES.has(v) ? v : DEFAULTS.style; }
             function coercePalette(v) { return VALID_PALETTES.has(v) ? v : DEFAULTS.palette; }
             function coerceIntensity(v) {
@@ -163,6 +204,7 @@
 
             let storedStyle = null, storedI = null, storedR = null, storedPalette = null, storedFretOnNote = null;
             let storedCustomImageDataUrl = null, storedCustomImageName = null;
+            let storedCustomVideoName = null;
             try {
                 storedStyle = localStorage.getItem('h3d_bg_style');
                 storedI = localStorage.getItem('h3d_bg_intensity');
@@ -171,6 +213,7 @@
                 storedFretOnNote = localStorage.getItem('h3d_bg_showFretOnNote');
                 storedCustomImageDataUrl = localStorage.getItem('h3d_bg_customImageDataUrl');
                 storedCustomImageName = localStorage.getItem('h3d_bg_customImageName');
+                storedCustomVideoName = localStorage.getItem('h3d_bg_customVideoName');
             } catch (_) { /* storage blocked */ }
 
             const style = coerceStyle(storedStyle);
@@ -180,6 +223,7 @@
             const showFretOnNote = coerceBool(storedFretOnNote, DEFAULTS.showFretOnNote);
             const customImageDataUrl = (typeof storedCustomImageDataUrl === 'string') ? storedCustomImageDataUrl : DEFAULTS.customImageDataUrl;
             const customImageName    = (typeof storedCustomImageName === 'string')    ? storedCustomImageName    : DEFAULTS.customImageName;
+            const customVideoName    = (typeof storedCustomVideoName === 'string')    ? storedCustomVideoName    : DEFAULTS.customVideoName;
 
             const sel = document.getElementById('h3d-bg-style');
             const sli = document.getElementById('h3d-bg-intensity');
@@ -191,6 +235,10 @@
             const clearBtn  = document.getElementById('h3d-bg-custom-image-clear');
             const nameP     = document.getElementById('h3d-bg-custom-image-name');
             const errorP    = document.getElementById('h3d-bg-custom-image-error');
+            const videoFileInput = document.getElementById('h3d-bg-custom-video-file');
+            const videoClearBtn  = document.getElementById('h3d-bg-custom-video-clear');
+            const videoNameP     = document.getElementById('h3d-bg-custom-video-name');
+            const videoErrorP    = document.getElementById('h3d-bg-custom-video-error');
             if (sli) sli.value = String(intensity);
             if (lbl) lbl.textContent = intensity.toFixed(2);
             if (pal) pal.value = palette;
@@ -231,6 +279,36 @@
                 errorP.classList.add('hidden');
             }
 
+            function videoOption() {
+                if (!sel) return null;
+                for (let i = 0; i < sel.options.length; i++) {
+                    if (sel.options[i].value === 'video') return sel.options[i];
+                }
+                return null;
+            }
+            function refreshVideoOptionState(hasVideo, displayName) {
+                const opt = videoOption();
+                if (opt) {
+                    opt.disabled = !hasVideo;
+                    opt.textContent = hasVideo
+                        ? ('Custom video' + (displayName ? ' — ' + displayName : ''))
+                        : 'Custom video (none uploaded)';
+                }
+                if (videoNameP) videoNameP.textContent = hasVideo
+                    ? ('Current: ' + (displayName || 'unnamed'))
+                    : 'No video uploaded.';
+            }
+            function showVideoError(msg) {
+                if (!videoErrorP) return;
+                videoErrorP.textContent = msg;
+                videoErrorP.classList.remove('hidden');
+            }
+            function clearVideoError() {
+                if (!videoErrorP) return;
+                videoErrorP.textContent = '';
+                videoErrorP.classList.add('hidden');
+            }
+
             // hasAsset must use the same validator as screen.js. A bare
             // truthy check would treat whitespace, garbage strings, or
             // unsupported types (e.g. data:image/svg+xml left over from
@@ -244,17 +322,28 @@
             const hasAsset = /^data:image\/(jpeg|png|webp);/i.test(trimmedCustomImageDataUrl);
             refreshImageOptionState(hasAsset, customImageName);
 
-            // Apply style AFTER the image option's disabled state is
-            // settled. If style === 'image' but no asset is uploaded
+            // Same shape for video: validate the persisted filename
+            // against the renderer-side pattern so a stale/manually-
+            // edited localStorage value (e.g. left over from a future
+            // schema change) doesn't enable a non-functional option.
+            // Lowercase normalization: routes.py only produces lowercase
+            // names, so a manually-edited `current.MP4` would otherwise
+            // pass an i-flag check and then 404 against the server.
+            const trimmedCustomVideoName = (typeof customVideoName === 'string')
+                ? customVideoName.trim().toLowerCase() : '';
+            const hasVideo = VIDEO_FILENAME_RE.test(trimmedCustomVideoName);
+            refreshVideoOptionState(hasVideo, trimmedCustomVideoName);
+
+            // Apply style AFTER both option disabled-states are settled.
+            // If style === 'image'/'video' but no asset is uploaded
             // (corrupt localStorage, manual edit), persist the fallback
             // through the setter so storage / UI / renderer all agree
-            // — without the setter call we'd leave h3d_bg_style=image
-            // in localStorage while the picker shows particles, and
-            // the renderer would mount the inert image style (build
-            // returns null) for a blank backdrop that doesn't match
-            // the visible UI selection.
+            // — without the setter call we'd leave the bad style in
+            // localStorage while the picker shows particles, and the
+            // renderer would mount the inert style (build returns null)
+            // for a blank backdrop that doesn't match the visible UI.
             if (sel) {
-                if (style === 'image' && !hasAsset) {
+                if ((style === 'image' && !hasAsset) || (style === 'video' && !hasVideo)) {
                     sel.value = DEFAULTS.style;
                     if (window.h3dBgSetStyle) window.h3dBgSetStyle(DEFAULTS.style);
                 } else {
@@ -369,6 +458,173 @@
                         sel.value = DEFAULTS.style;
                         if (window.h3dBgSetStyle) window.h3dBgSetStyle(DEFAULTS.style);
                     }
+                });
+            }
+
+            if (videoFileInput) {
+                videoFileInput.addEventListener('change', function () {
+                    clearVideoError();
+                    const file = videoFileInput.files && videoFileInput.files[0];
+                    if (!file) return;
+                    if (file.size > MAX_VIDEO_BYTES) {
+                        showVideoError('Video must be ≤50 MB (got ' + (file.size / 1024 / 1024).toFixed(1) + ' MB).');
+                        videoFileInput.value = '';
+                        return;
+                    }
+                    // file.type is empty or `application/octet-stream`
+                    // in some browsers / OSes (older Windows shells,
+                    // some Linux MIME tables) even for valid .mp4 /
+                    // .webm. Fall back to the extension when the
+                    // type isn't reported or is the generic
+                    // octet-stream — matches the server-side fallback
+                    // in routes.py so a working browser doesn't get
+                    // rejected on either side.
+                    const extOk = /\.(mp4|webm)$/i.test(file.name || '');
+                    const typeIsKnown = file.type && file.type !== 'application/octet-stream';
+                    const typeOk = typeIsKnown
+                        ? ALLOWED_VIDEO_MIMES.has(file.type)
+                        : extOk;
+                    if (!typeOk) {
+                        showVideoError('File must be an MP4 or WebM video.');
+                        videoFileInput.value = '';
+                        return;
+                    }
+                    // POST to the plugin's upload route. routes.py
+                    // streams the body with a server-side size guard
+                    // and writes to disk under a deterministic
+                    // single-slot filename (current.<ext>) — each
+                    // upload replaces the previous file.
+                    const fd = new FormData();
+                    fd.append('file', file);
+                    fetch(VIDEO_UPLOAD_URL, { method: 'POST', body: fd })
+                        .then(function (resp) {
+                            if (!resp.ok) {
+                                return resp.text().then(function (txt) {
+                                    // FastAPI error bodies are JSON
+                                    // like {"detail": ...}. detail can
+                                    // be:
+                                    //  - string: "Only MP4 and WebM…"
+                                    //  - array of objects (422
+                                    //    validation errors): each
+                                    //    item has msg / loc / type
+                                    //  - plain object
+                                    // Stringify each shape into
+                                    // something readable so the error
+                                    // banner doesn't surface
+                                    // "[object Object]".
+                                    let msg = '';
+                                    try {
+                                        const detail = JSON.parse(txt).detail;
+                                        if (typeof detail === 'string') {
+                                            msg = detail;
+                                        } else if (Array.isArray(detail)) {
+                                            msg = detail
+                                                .map(function (d) { return (d && d.msg) || JSON.stringify(d); })
+                                                .join('; ');
+                                        } else if (detail && typeof detail === 'object') {
+                                            msg = JSON.stringify(detail);
+                                        }
+                                        if (!msg) msg = txt;
+                                    } catch (_) {
+                                        msg = txt || ('HTTP ' + resp.status);
+                                    }
+                                    throw new Error(msg);
+                                });
+                            }
+                            return resp.json();
+                        })
+                        .then(function (data) {
+                            // Lowercase the server response too — routes.py
+                            // produces lowercase, but defending against a
+                            // future server change or proxy munging the
+                            // case is cheap and keeps the contract crisp.
+                            const name = String((data && data.name) || '').toLowerCase();
+                            if (!VIDEO_FILENAME_RE.test(name)) {
+                                throw new Error('Server returned an unexpected filename.');
+                            }
+                            if (window.h3dBgSetCustomVideo) {
+                                window.h3dBgSetCustomVideo({ name: name });
+                            }
+                            refreshVideoOptionState(true, name);
+                            videoFileInput.value = '';
+                            // _bgWriteGlobal intentionally swallows
+                            // localStorage.setItem failures (full quota,
+                            // blocked storage in private mode) and falls
+                            // back to the in-memory _bgMemFallback, so
+                            // setCustomVideo never throws even when
+                            // persistence failed. Re-read to verify;
+                            // surface a session-only warning that
+                            // matches what the image flow does. The
+                            // video itself works for this session
+                            // because the renderer reads from the
+                            // mem-fallback ahead of localStorage.
+                            let persisted = false;
+                            try { persisted = localStorage.getItem('h3d_bg_customVideoName') === name; } catch (_) { /* storage blocked */ }
+                            if (!persisted) {
+                                showVideoError('Video applied for this session, but the filename pointer could not be saved (storage may be full or blocked). It will be lost on refresh.');
+                            }
+                        })
+                        .catch(function (err) {
+                            showVideoError('Upload failed: ' + (err && err.message ? err.message : err));
+                            videoFileInput.value = '';
+                        });
+                });
+            }
+
+            if (videoClearBtn) {
+                videoClearBtn.addEventListener('click', function () {
+                    clearVideoError();
+                    // Slot-level clear: DELETE on the upload endpoint
+                    // (no filename in the path) removes every
+                    // current.* the upload dir holds. This matches
+                    // the slot's design intent — the dir is a single
+                    // logical asset slot, not a list of named files,
+                    // so clear should empty it regardless of which
+                    // extension currently lives there.
+                    fetch(VIDEO_UPLOAD_URL, { method: 'DELETE' })
+                        .then(function (resp) {
+                            // Defense: surface non-2xx errors so a
+                            // future server change to the contract
+                            // (auth, rate limit, etc.) doesn't go
+                            // unnoticed. Today's routes.py is
+                            // best-effort and always 200.
+                            if (!resp.ok) {
+                                throw new Error('HTTP ' + resp.status);
+                            }
+                            return resp.json().catch(function () { return {}; });
+                        })
+                        .then(function (data) {
+                            // Soft warning when the server kept any
+                            // file (Windows file lock, antivirus, an
+                            // in-flight GET) — the next upload's
+                            // pre-cleanup will retry, but flag it so
+                            // the user knows operator-side cleanup
+                            // may be needed.
+                            const leftover = (data && data.leftover) || [];
+                            if (leftover.length > 0) {
+                                showVideoError('Settings cleared, but server could not remove: ' +
+                                    leftover.map(function (l) { return l.name; }).join(', '));
+                            }
+                        })
+                        .catch(function (err) {
+                            // Network failure or non-2xx; non-fatal
+                            // for the UX — we still clear the local
+                            // pointer so the renderer stops trying
+                            // to load the asset. Surface the error
+                            // for visibility.
+                            showVideoError('Server clear failed (' +
+                                (err && err.message ? err.message : err) +
+                                '). Local settings cleared anyway.');
+                        })
+                        .finally(function () {
+                            if (window.h3dBgClearCustomVideo) window.h3dBgClearCustomVideo();
+                            refreshVideoOptionState(false, '');
+                            if (videoFileInput) videoFileInput.value = '';
+                            if (sel && sel.value === 'video') {
+                                sel.value = DEFAULTS.style;
+                                if (window.h3dBgSetStyle) window.h3dBgSetStyle(DEFAULTS.style);
+                            }
+                        });
                 });
             }
         })();

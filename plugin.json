@@ -1,8 +1,9 @@
 {
     "id": "highway_3d",
     "name": "3D Highway",
-    "version": "3.6.0",
+    "version": "3.7.0",
     "type": "visualization",
     "script": "screen.js",
-    "settings": { "html": "settings.html" }
+    "settings": { "html": "settings.html" },
+    "routes": "routes.py"
 }
