@@ -99,7 +99,26 @@
     const CAM_TGT_TAU_T    = 0.35;  // s — twitchy: short recency time-constant
     const CAM_TGT_TAU_C    = 0.9;   // s — calm: longer time-constant (averages more)
     const CAM_TGT_HYST_T   = 0.25;  // frets — twitchy: tiny dead zone
-    const CAM_TGT_HYST_C   = 2.5;   // frets — calm: wide dead zone
+    const CAM_TGT_HYST_C   = 5.0;   // frets — calm: ~5-fret dead zone, wide
+                                    // enough to swallow chord-to-chord
+                                    // alternations across a 6-fret span
+                                    // (e.g. Am ↔ D in first position).
+
+    // Zoom (tgtDist) damping, also driven by cameraSmoothing.
+    // Issue #34 follow-up: the original PR only damped X targeting, leaving
+    // tgtDist untreated — a single distant high-fret note still pulled the
+    // camera back, then sprang forward as the note aged out of the
+    // 3.5 s lookahead window.
+    const CAM_DIST_HYST_T  = 0.5;   // fret-span — twitchy: minimal dead zone
+    const CAM_DIST_HYST_C  = 5.0;   // fret-span — calm: 5-fret span change required
+
+    // Note: we deliberately do NOT scale the camUpdate lerp speed with
+    // cameraSmoothing. Smoothing widens the hysteresis dead zones so the
+    // camera stays put through small/repetitive shifts; but when a shift
+    // *does* clear the gate (a real jump to a far fret), we want the slide
+    // to be snappy, not lethargic. The dead zone gates "should we move?",
+    // the BPM-scaled lerp answers "how fast" — keeping those orthogonal
+    // gives the right feel.
 
     const FOG_START = 200 * K;
     const FOG_END   = 670 * K;
@@ -2227,12 +2246,14 @@
                 if (now - fretLastActiveTime[f] < FRET_COOLDOWN) activeFrets.add(f);
             }
 
-            // Camera targeting. fMin/fMax over the full visible window
-            // continue to drive tgtDist (zoom-out for wide chords). tgtX
-            // is driven separately by a recency-weighted centroid in
-            // world units over a narrower window (issue #34) so distant
-            // outliers don't yank the camera left/right.
-            let fMin = 99, fMax = 0, got = false;
+            // Camera targeting (issue #34 + follow-up). Both tgtX and
+            // tgtDist now derive from the narrowed [camT0, camT1] window
+            // — tgtX as a recency-weighted centroid, tgtDist from the
+            // fret span — so distant outliers can't yank either axis.
+            // Hysteresis dead-zone widths key off cameraSmoothing; the
+            // camUpdate() lerp itself stays BPM-driven only, so the gate
+            // controls whether the camera moves and the BPM lerp controls
+            // how fast it slides once a move is committed.
             const cs        = cameraSmoothing;
             const camAhead  = CAM_TGT_AHEAD_T + (CAM_TGT_AHEAD_C - CAM_TGT_AHEAD_T) * cs;
             const camTau    = CAM_TGT_TAU_T   + (CAM_TGT_TAU_C   - CAM_TGT_TAU_T)   * cs;
@@ -2240,6 +2261,11 @@
             const camT0     = now - CAM_TGT_BEHIND;
             const camT1     = now + camAhead;
             let camWX = 0, camWSum = 0;
+            // tgtDist hysteresis (issue #34 follow-up): track fret span over
+            // the SAME narrowed window as X targeting, so a single high-fret
+            // note 2.5 s away no longer pulls the zoom out and back.
+            let camDistMin = 99, camDistMax = 0, camDistGot = false;
+            const camDistHystF = CAM_DIST_HYST_T + (CAM_DIST_HYST_C - CAM_DIST_HYST_T) * cs;
 
             // ── Single notes ──────────────────────────────────────────────
             const lastFretForString = new Array(nStr).fill(undefined);
@@ -2256,11 +2282,13 @@
                     const skipLabel   = lastFretForString[n.s] === n.f;
                     drawNote(n, now, undefined, isNext, skipLabel, false);
                     lastFretForString[n.s] = n.f;
-                    if (n.f > 0 && n.t <= t1) { fMin = Math.min(fMin, n.f); fMax = Math.max(fMax, n.f); got = true; }
                     if (n.f > 0 && n.t >= camT0 && n.t <= camT1) {
                         const w = Math.exp(-Math.max(0, n.t - now) / camTau);
                         camWX   += fretMid(n.f) * w;
                         camWSum += w;
+                        if (n.f < camDistMin) camDistMin = n.f;
+                        if (n.f > camDistMax) camDistMax = n.f;
+                        camDistGot = true;
                     }
                 }
             }
@@ -2275,9 +2303,9 @@
                     // Filter chord notes to in-range strings once. All
                     // chord-level aggregations (maxSus, repeat-chord
                     // signature, open-string centroid, frame-box bounds,
-                    // active-fret highlights, fMin/fMax) read from
-                    // chordNotes so a clamped 9th-string note can't, for
-                    // instance, extend the chord's linger beyond its
+                    // active-fret highlights, camera-window dist) read
+                    // from chordNotes so a clamped 9th-string note can't,
+                    // for instance, extend the chord's linger beyond its
                     // visible sustain.
                     const chordNotes = filterValidNotes(ch.notes);
                     if (chordNotes.length === 0) continue;
@@ -2314,8 +2342,13 @@
                         const skipLabel = lastFretForString[cn.s] === cn.f;
                         drawNote({ ...cn, t: ch.t, sus: cn.sus || 0 }, now, cn.f === 0 ? chordCX : undefined, isNext, skipLabel, isRepeat, 0.55);
                         lastFretForString[cn.s] = cn.f;
-                        if (cn.f > 0 && ch.t <= t1) { fMin = Math.min(fMin, cn.f); fMax = Math.max(fMax, cn.f); got = true; }
-                        if (cn.f > 0 && chWindowed) { camWX += fretMid(cn.f) * chW; camWSum += chW; }
+                        if (cn.f > 0 && chWindowed) {
+                            camWX += fretMid(cn.f) * chW;
+                            camWSum += chW;
+                            if (cn.f < camDistMin) camDistMin = cn.f;
+                            if (cn.f > camDistMax) camDistMax = cn.f;
+                            camDistGot = true;
+                        }
                     }
 
                     // Chord frame-box
@@ -2479,12 +2512,22 @@
             }
 
             // ── Camera target ─────────────────────────────────────────────
-            // tgtDist still tracks the visible-window fret span so wide
-            // chords pull the camera back; tgtX uses the narrowed,
-            // recency-weighted centroid with a hysteresis dead zone so
-            // small intra-cluster shifts don't produce visible motion.
-            if (got) {
-                tgtDist = (65 + Math.max(fMax - fMin, 4) * 3) * K;
+            // tgtX, tgtDist both driven from the narrowed [camT0, camT1]
+            // window, with hysteresis dead zones scaled by cameraSmoothing
+            // so small candidate shifts inside a cluster don't trigger
+            // visible motion. Distant outliers in the full visible window
+            // no longer pull either axis.
+            if (camDistGot) {
+                const candidateDist = (65 + Math.max(camDistMax - camDistMin, 4) * 3) * K;
+                // tgtDist scales at (3 * K) per fret-span unit, so the
+                // hysteresis threshold (a fret-span dead zone) converts
+                // to tgtDist-space by multiplying by 3 * K — NOT by
+                // FRET_WIDTH_MID, which is X-axis world-units-per-fret
+                // and a different unit (would over-tighten the gate by
+                // ~4x at SCALE = 2.25).
+                if (Math.abs(candidateDist - tgtDist) > camDistHystF * 3 * K) {
+                    tgtDist = candidateDist;
+                }
             }
             if (camWSum > 0) {
                 const candidateX = camWX / camWSum;
