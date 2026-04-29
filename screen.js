@@ -1346,17 +1346,91 @@
         const sY = s => S_BASE + (_invertedCached ? s : (nStr - 1 - s)) * S_GAP;
 
         // ── Text-sprite cache ──────────────────────────────────────────────
-        function txtMat(text, col, wide) {
-            const k = (wide ? 'W' : '') + text + '|' + col;
+        // ── Text-sprite style presets ─────────────────────────────────────
+        // Each preset describes how a class of label is rasterised.
+        // Tweak per-class look here (font, outline color/width, source
+        // canvas size). `wide` toggles a long aspect ratio for multi-char
+        // labels (chord/section names, "↑1/2", "~~~").
+        //
+        // Knobs:
+        //   font        — full CSS font shorthand (weight + size + family)
+        //   wideFont    — same, used when caller passes wide=true
+        //   srcH        — source-canvas height in px (square; wide=4×).
+        //                 Keep power-of-two so WebGL1 / Three.js retain
+        //                 mipmaps + linear-mip-linear filtering — NPOT
+        //                 textures silently fall back to no-mipmap and
+        //                 shimmer at distance.
+        //   stroke      — outline color (null = no outline)
+        //   strokeW     — outline line-width in source-canvas px
+        //   shadow      — { color, blur, dx, dy } or null
+        const TXT_STYLES = {
+            // The two fret-number sets the user wants to pop hardest.
+            fretRow: {
+                font:     '900 160px "Arial Black", "Helvetica Neue", Arial, sans-serif',
+                wideFont: '900 128px "Arial Black", "Helvetica Neue", Arial, sans-serif',
+                srcH: 256, stroke: '#0a1018', strokeW: 18,
+                shadow: { color: 'rgba(0,0,0,0.7)', blur: 14, dx: 0, dy: 0 },
+            },
+            noteFret: {
+                font:     '900 160px "Arial Black", "Helvetica Neue", Arial, sans-serif',
+                wideFont: '900 128px "Arial Black", "Helvetica Neue", Arial, sans-serif',
+                srcH: 256, stroke: '#0a1018', strokeW: 18,
+                shadow: { color: 'rgba(0,0,0,0.7)', blur: 14, dx: 0, dy: 0 },
+            },
+            // Chord names — gold script-style label, lighter outline keeps
+            // the colour readable.
+            chord: {
+                font:     'bold 80px sans-serif',
+                wideFont: 'bold 64px sans-serif',
+                srcH: 128, stroke: '#0a1018', strokeW: 6, shadow: null,
+            },
+            // Section banners ("Verse", "Chorus") — same as chord weight.
+            section: {
+                font:     'bold 80px sans-serif',
+                wideFont: 'bold 64px sans-serif',
+                srcH: 128, stroke: '#0a1018', strokeW: 6, shadow: null,
+            },
+            // Technique markers (PH, PM, AC, H/P/T, slide arrows, etc.).
+            technique: {
+                font:     'bold 80px sans-serif',
+                wideFont: 'bold 64px sans-serif',
+                srcH: 128, stroke: '#0a1018', strokeW: 6, shadow: null,
+            },
+            // Open-string "0" label on the note body itself.
+            open: {
+                font:     'bold 80px sans-serif',
+                wideFont: 'bold 64px sans-serif',
+                srcH: 128, stroke: '#0a1018', strokeW: 6, shadow: null,
+            },
+        };
+
+        function txtMat(text, col, wide, style) {
+            const sName = style || 'technique';
+            const k = sName + '|' + (wide ? 'W' : '') + text + '|' + col;
             if (txtCache[k]) return txtCache[k];
-            const w = wide ? 512 : 128, h = 128;
-            const c = document.createElement('canvas');
+            const sp = TXT_STYLES[sName] || TXT_STYLES.technique;
+            const h  = sp.srcH;
+            const w  = wide ? h * 4 : h;
+            const c  = document.createElement('canvas');
             c.width = w; c.height = h;
             const x = c.getContext('2d');
-            x.fillStyle = col;
-            x.font = `bold ${wide ? 64 : 80}px monospace`;
+            x.font = wide ? sp.wideFont : sp.font;
             x.textAlign = 'center';
             x.textBaseline = 'middle';
+            if (sp.shadow) {
+                x.shadowColor   = sp.shadow.color;
+                x.shadowBlur    = sp.shadow.blur;
+                x.shadowOffsetX = sp.shadow.dx;
+                x.shadowOffsetY = sp.shadow.dy;
+            }
+            if (sp.stroke && sp.strokeW > 0) {
+                x.lineJoin    = 'round';
+                x.miterLimit  = 2;
+                x.strokeStyle = sp.stroke;
+                x.lineWidth   = sp.strokeW;
+                x.strokeText(String(text), w / 2, h / 2);
+            }
+            x.fillStyle = col;
             x.fillText(String(text), w / 2, h / 2);
             const mat = new T.SpriteMaterial({
                 map: new T.CanvasTexture(c),
@@ -1673,12 +1747,12 @@
             pNote       = pool(noteG, () => new T.Mesh(gNote, mStr[0]));
             pSus        = pool(noteG, () => new T.Mesh(gSus, mSus[0]));
             pSusOutline = pool(noteG, () => new T.Mesh(gSus, mSusOutline));
-            pLbl  = pool(lblG,  () => new T.Sprite(txtMat('0', '#fff', false)));
+            pLbl  = pool(lblG,  () => new T.Sprite(txtMat('0', '#fff', false, 'technique')));
             pBeat = pool(beatG, () => new T.Line(gBeat, mBeatQ));
-            pSec  = pool(lblG,  () => new T.Sprite(txtMat('', '#0dd', true)));
+            pSec  = pool(lblG,  () => new T.Sprite(txtMat('', '#0dd', true, 'section')));
 
             // Dynamic fret number labels (heat-coloured, updated each frame)
-            pFretLbl = pool(lblG, () => new T.Sprite(txtMat('0', '#888', false)));
+            pFretLbl = pool(lblG, () => new T.Sprite(txtMat('0', '#888', false, 'fretRow')));
 
             // Highlight lane plane over active fret range
             pLane = pool(noteG, () => new T.Mesh(
@@ -1702,14 +1776,14 @@
                 }),
             ));
 
-            pChordLbl   = pool(lblG,  () => new T.Sprite(txtMat('', '#e8d080', true).clone()));
+            pChordLbl   = pool(lblG,  () => new T.Sprite(txtMat('', '#e8d080', true, 'chord').clone()));
             pBarreLine  = pool(noteG, () => new T.Mesh(
                 new T.BoxGeometry(1, 1, 1),
                 new T.MeshLambertMaterial({ color: 0xffffff, emissive: 0xffffff, emissiveIntensity: 0.9, transparent: true, depthWrite: false }),
             ));
 
             // Per-note fret number below note with connector line
-            pNoteFretLabel = pool(lblG, () => new T.Sprite(txtMat('0', '#ffffff', false).clone()));
+            pNoteFretLabel = pool(lblG, () => new T.Sprite(txtMat('0', '#ffffff', false, 'noteFret').clone()));
             pConnectorLine = pool(noteG, () => new T.Line(
                 new T.BufferGeometry().setFromPoints([new T.Vector3(0, 0, 0), new T.Vector3(0, 1, 0)]),
                 new T.LineBasicMaterial({ color: 0xaaaaaa, transparent: true, opacity: 0.5 }),
@@ -2388,7 +2462,7 @@
                                 const postFade = chDt < 0 ? Math.max(0, 1 + chDt / 0.55) : 1;
                                 const lblW = 28 * K, lblH = 9 * K;
                                 const lbl = pChordLbl.get();
-                                const mat = txtMat(chordName, '#e8d080', true);
+                                const mat = txtMat(chordName, '#e8d080', true, 'chord');
                                 if (lbl.material.map !== mat.map) { lbl.material.map = mat.map; lbl.material.needsUpdate = true; }
                                 lbl.material.opacity = Math.min(1, 0.3 + fade * 0.7) * postFade;
                                 lbl.position.set((cx - width / 2) + lblW / 2, yMaxF + lblH / 2, z);
@@ -2475,7 +2549,7 @@
                 for (let f = 1; f <= NFRETS; f++) {
                     const lb       = pFretLbl.get();
                     const isActive = activeFrets.has(f);
-                    lb.material    = txtMat(f, isActive ? '#ffe84d' : '#9ab8cc', false);
+                    lb.material    = txtMat(f, isActive ? '#ffe84d' : '#9ab8cc', false, 'fretRow');
                     lb.position.set(fretMid(f), yBottom - S_GAP * 1.4, 0.5 * K);
                     const intensity = noteState.fretHeat[f];
                     lb.material.opacity = 0.35 + intensity * 0.65;
@@ -2505,7 +2579,7 @@
                 for (const s of sections) {
                     if (s.time < t0 || s.time > t1) continue;
                     const sp = pSec.get();
-                    sp.material = txtMat(s.name, '#00cccc', true);
+                    sp.material = txtMat(s.name, '#00cccc', true, 'section');
                     sp.scale.set(20 * K, 5 * K, 1);
                     sp.position.set(fretX(12), labelY, dZ(s.time - now));
                 }
@@ -2635,7 +2709,7 @@
                 if (n.f === 0) {
                     // "0" label on open string
                     const lb = pLbl.get();
-                    lb.material = txtMat(0, hit ? '#fff' : '#ddd', false);
+                    lb.material = txtMat(0, hit ? '#fff' : '#ddd', false, 'open');
                     lb.scale.set(NW * 0.7, NH * 0.8, 1);
                     lb.position.set(x, y + vibrato, noteZ + 0.01 * K);
                 } else if (showFretOnNote && n.f > 0) {
@@ -2654,7 +2728,7 @@
                     // of how K resolves, units consistent with the
                     // core's offset.
                     const lb = pLbl.get();
-                    lb.material = txtMat(n.f, hit ? '#fff' : '#eee', false);
+                    lb.material = txtMat(n.f, hit ? '#fff' : '#eee', false, 'noteFret');
                     lb.scale.set(NW * 0.7, NH * 0.85, 1);
                     lb.position.set(x, y + vibrato, noteZ + 0.005);
                 }
@@ -2713,27 +2787,27 @@
                 let yo = y + NH * 0.8 * sLbl;
                 if (n.bn > 0) {
                     const l = pLbl.get();
-                    l.material = txtMat('↑' + bendText(n.bn), '#fff', true);
+                    l.material = txtMat('↑' + bendText(n.bn), '#fff', true, 'technique');
                     l.scale.set(NH * 3.6 * sLbl, NH * 1.5 * sLbl, 1); l.position.set(x, yo, noteZ); yo += NH * 1.2 * sLbl;
                 }
                 if (n.sl && n.sl !== -1) {
                     const l = pLbl.get();
-                    l.material = txtMat(n.sl > n.f ? '↗' : '↘', '#fff', false);
+                    l.material = txtMat(n.sl > n.f ? '↗' : '↘', '#fff', false, 'technique');
                     l.scale.set(NH * 1.6 * sLbl, NH * 1.6 * sLbl, 1); l.position.set(x + NW * 0.6 * sLbl, yo, noteZ);
                 }
                 if (n.ho || n.po || n.tp) {
                     const l = pLbl.get();
-                    l.material = txtMat(n.ho ? 'H' : n.po ? 'P' : 'T', '#fff', false);
+                    l.material = txtMat(n.ho ? 'H' : n.po ? 'P' : 'T', '#fff', false, 'technique');
                     l.scale.set(NH * 1.5 * sLbl, NH * 1.5 * sLbl, 1); l.position.set(x + NW * 0.6 * sLbl, yo, noteZ);
                 }
                 if (n.ac) {
                     const l = pLbl.get();
-                    l.material = txtMat('>', '#fff', false);
+                    l.material = txtMat('>', '#fff', false, 'technique');
                     l.scale.set(NH * 1.6 * sLbl, NH * 1.6 * sLbl, 1); l.position.set(x, yo, noteZ); yo += NH * 1.2 * sLbl;
                 }
                 if (n.tr) {
                     const l = pLbl.get();
-                    l.material = txtMat('~~~', '#ff0', true);
+                    l.material = txtMat('~~~', '#ff0', true, 'technique');
                     l.scale.set(NH * 3.0 * sLbl, NH * 1.2 * sLbl, 1); l.position.set(x, yo, noteZ);
                 }
                 if (n.pm) {
@@ -2742,7 +2816,7 @@
                     // anchored to the body not floating above.
                     const pmMark = pLbl.get();
                     if (!pmMark._pmMat) {
-                        pmMark._pmMat = txtMat('X', '#ffffff', false).clone();
+                        pmMark._pmMat = txtMat('X', '#ffffff', false, 'technique').clone();
                         _ownedClonedMats.push(pmMark._pmMat);
                     }
                     pmMark.material = pmMark._pmMat;
@@ -2753,7 +2827,7 @@
                 }
                 if (n.hp) {
                     const l = pLbl.get();
-                    l.material = txtMat('PH', '#ff0', true);
+                    l.material = txtMat('PH', '#ff0', true, 'technique');
                     l.scale.set(NH * 2.1 * sLbl, NH * 1.2 * sLbl, 1); l.position.set(x, y - NH * 1.1 * sLbl, noteZ);
                 }
 
@@ -2765,7 +2839,7 @@
                     const alpha      = Math.max(0, Math.min(1, dt / 0.5)) * Math.min(1, (AHEAD - dt) / (AHEAD * 0.4));
 
                     const fretLabel  = pNoteFretLabel.get();
-                    const cachedMat  = txtMat(n.f, '#ffffff', false);
+                    const cachedMat  = txtMat(n.f, '#ffffff', false, 'noteFret');
                     if (fretLabel.material.map !== cachedMat.map) {
                         fretLabel.material.map = cachedMat.map;
                         fretLabel.material.needsUpdate = true;
