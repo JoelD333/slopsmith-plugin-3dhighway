@@ -312,20 +312,26 @@
     }
     // In-memory fallback for when localStorage is blocked (private mode,
     // sandboxed iframes, some test runners). _bgWriteGlobal stages the
-    // value here too, and _bgReadSetting falls through to it before
-    // BG_DEFAULTS. Without this, a write that silently failed to
-    // persist would still emit a change event — and the listener would
-    // read back the default, immediately blowing away what the user
-    // just picked in settings.html.
+    // value here unconditionally, so it always reflects the most recent
+    // in-session intent — _bgReadSetting prefers it over the global
+    // localStorage slot to avoid serving a stale persisted value when
+    // a write failed silently (quota exceeded, etc.). Per-panel
+    // localStorage overrides still win because they're an explicit
+    // per-instance opt-out and shouldn't be shadowed by a global edit.
     const _bgMemFallback = Object.create(null);
     function _bgReadSetting(panelKey, key) {
+        let panelVal = null;
+        let globalVal = null;
         try {
-            const panelVal = localStorage.getItem('h3d_bg_' + panelKey + '_' + key);
-            if (panelVal !== null && panelVal !== undefined) return _bgCoerce(key, panelVal);
-            const globalVal = localStorage.getItem('h3d_bg_' + key);
-            if (globalVal !== null && globalVal !== undefined) return _bgCoerce(key, globalVal);
-        } catch (_) { /* storage blocked — fall through to in-memory */ }
+            panelVal = localStorage.getItem('h3d_bg_' + panelKey + '_' + key);
+            globalVal = localStorage.getItem('h3d_bg_' + key);
+        } catch (_) { /* storage blocked — both stay null */ }
+        if (panelVal !== null && panelVal !== undefined) return _bgCoerce(key, panelVal);
+        // Prefer the in-memory staged value over the persisted global slot.
+        // _bgWriteGlobal always writes to _bgMemFallback first, so the
+        // memory value is at least as fresh as the persisted one.
         if (key in _bgMemFallback) return _bgCoerce(key, _bgMemFallback[key]);
+        if (globalVal !== null && globalVal !== undefined) return _bgCoerce(key, globalVal);
         return BG_DEFAULTS[key];
     }
     // Shared "stored string -> bool" coercion for every boolean
