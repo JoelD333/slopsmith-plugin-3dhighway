@@ -2744,7 +2744,11 @@
                         const arrowScale = NH * 0.75 * sLbl;
                         arrow.position.set(x, y + vibrato, noteZ + 1.1 * K);
                         arrow.rotation.z = (isHarm ? Math.PI / 4 : 0);
-                        arrow.scale.set(arrowScale, n.ho ? -arrowScale : arrowScale, 1);
+                        // gTechArrow points UP in local space (apex at +y).
+                        // HO ascends in pitch → arrow stays up (positive y-scale).
+                        // PO descends in pitch → flip y-scale negative so the
+                        // arrow points down.
+                        arrow.scale.set(arrowScale, n.ho ? arrowScale : -arrowScale, 1);
                         arrow.renderOrder = 2;
                     } else {
                         const chevron = pTapChevron.get();
