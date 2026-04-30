@@ -2942,11 +2942,12 @@
             scene = cam = noteG = beatG = lblG = fretG = null;
             ambLight = dirLight = null;
             mStr = []; mGlow = []; mSus = []; mProj = []; mProjGlow = []; mWhiteOutline = mSusOutline = null; mHitOutline = mMissOutline = null; stringLines = [];
-            // The shared technique-mesh materials are owned here too —
-            // the renderer.dispose() above doesn't reach standalone
-            // materials that don't belong to a still-mounted mesh.
-            mTechArrow?.dispose?.(); mTechArrow = null;
-            mTapChevron?.dispose?.(); mTapChevron = null;
+            // mTechArrow / mTapChevron are owned by pooled meshes attached to
+            // noteG. The scene.traverse() dispose pass above already frees
+            // them once any pool factory has instantiated a mesh, so we
+            // only need to drop our local references here. Calling
+            // dispose() explicitly would double-dispose.
+            mTechArrow = mTapChevron = null;
             lyricsCanvas = lyricsCtx = null;
             projMeshArr = projGlowArr = null;
             _probe = null;
