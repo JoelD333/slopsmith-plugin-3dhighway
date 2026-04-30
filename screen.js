@@ -520,8 +520,8 @@
     const BG_STYLES = {
         off: {
             build() { return null; },
-            update() { },
-            teardown() { },
+            update() {},
+            teardown() {},
         },
         particles: {
             build(scene, settings) {
@@ -1155,6 +1155,11 @@
         let gNote = null, gSus = null, gBeat = null, gTechArrow = null, gTapChevron = null;
         let mStr = [], mGlow = [], mSus = [], mProj = [], mProjGlow = [];
         let mWhiteOutline = null, mSusOutline = null;
+        // Shared materials for the legato technique meshes — one per geometry
+        // type, reused across every pooled mesh instance to avoid per-mesh
+        // material allocation in dense HO/PO/tap passages. Built lazily on
+        // first pool() call so they pick up the active palette / scene.
+        let mTechArrow = null, mTapChevron = null;
         // Notedetect feedback outlines (issue #9). Created in initScene
         // alongside mWhiteOutline; swapped onto the note's outline mesh
         // when a recent notedetect:hit / :miss event matches the note's
@@ -1681,7 +1686,11 @@
             pNote = pool(noteG, () => new T.Mesh(gNote, mStr[0]));
             pSus = pool(noteG, () => new T.Mesh(gSus, mSus[0]));
             pSusOutline = pool(noteG, () => new T.Mesh(gSus, mSusOutline));
-            pTechArrow = pool(noteG, () => new T.Mesh(gTechArrow, new T.MeshLambertMaterial({
+            // One shared material per technique-mesh type. The pool factory
+            // hands out fresh meshes that all reference the same material,
+            // so a dense HO/PO passage doesn't churn N MeshLambertMaterial
+            // allocations and N GPU material switches.
+            mTechArrow = new T.MeshLambertMaterial({
                 color: 0xffffff,
                 emissive: 0xffffff,
                 emissiveIntensity: 0.9,
@@ -1689,18 +1698,18 @@
                 opacity: 1.0,
                 side: T.DoubleSide,
                 depthWrite: true,
-            })));
-            pTapChevron = pool(noteG, () => {
-                return new T.Mesh(gTapChevron, new T.MeshLambertMaterial({
-                    color: 0xd4d4d4,
-                    emissive: 0xd4d4d4,
-                    emissiveIntensity: 0.9,
-                    transparent: true,
-                    opacity: 0.85,
-                    side: T.DoubleSide,
-                    depthWrite: false,
-                }));
             });
+            mTapChevron = new T.MeshLambertMaterial({
+                color: 0xd4d4d4,
+                emissive: 0xd4d4d4,
+                emissiveIntensity: 0.9,
+                transparent: true,
+                opacity: 0.85,
+                side: T.DoubleSide,
+                depthWrite: false,
+            });
+            pTechArrow = pool(noteG, () => new T.Mesh(gTechArrow, mTechArrow));
+            pTapChevron = pool(noteG, () => new T.Mesh(gTapChevron, mTapChevron));
             pLbl = pool(lblG, () => new T.Sprite(txtMat('0', '#fff', false)));
             pBeat = pool(beatG, () => new T.Line(gBeat, mBeatQ));
             pSec = pool(lblG, () => new T.Sprite(txtMat('', '#0dd', true)));
@@ -2925,6 +2934,11 @@
             scene = cam = noteG = beatG = lblG = fretG = null;
             ambLight = dirLight = null;
             mStr = []; mGlow = []; mSus = []; mProj = []; mProjGlow = []; mWhiteOutline = mSusOutline = null; mHitOutline = mMissOutline = null; stringLines = [];
+            // The shared technique-mesh materials are owned here too —
+            // the renderer.dispose() above doesn't reach standalone
+            // materials that don't belong to a still-mounted mesh.
+            mTechArrow?.dispose?.(); mTechArrow = null;
+            mTapChevron?.dispose?.(); mTapChevron = null;
             lyricsCanvas = lyricsCtx = null;
             projMeshArr = projGlowArr = null;
             _probe = null;
