@@ -1308,6 +1308,10 @@
         // Camera state
         let tgtX = 0, curX = 0;
         let tgtDist = CAM_DIST_BASE, curDist = CAM_DIST_BASE;
+        // Last committed lowFretBonus contribution baked into tgtDist
+        // (see candidateDist block — bonus is applied on top of the
+        // hysteresis-gated base).
+        let prevLowFretBonus = 0;
         let tgtLookY = 0, curLookY = 0;   // lerped look-at Y for self-correcting camera
         let aspectScale = 1;
 
@@ -2398,6 +2402,21 @@
             // tgtDist hysteresis (issue #34 follow-up): track fret span over
             // the SAME narrowed window as X targeting, so a single high-fret
             // note 2.5 s away no longer pulls the zoom out and back.
+            //
+            // Sustain extension: the outer loop keeps notes/chords
+            // whose sustain still rings into the visible window —
+            // n.t + (n.sus || 0) >= t0 for notes, ch.t + maxSus >= t0
+            // for chords — via the continue-filters below at the top
+            // of the single-note and chord branches. camT0 is narrower
+            // than t0, so an onset can age past camT0 while still
+            // being on screen and audible. Mirror that past-side
+            // allowance here so a held low-fret chord keeps
+            // contributing to both camDist (zoom) and camWX (X
+            // target); otherwise the camera dollies/pans away
+            // mid-sustain, re-clipping the very chord the low-fret
+            // pullback was added to keep on screen. The future side
+            // (camT1) is left alone so the #34 invariant (distant
+            // high-fret onsets don't pre-pull the camera) still holds.
             let camDistMin = 99, camDistMax = 0, camDistGot = false;
             const camDistHystF = CAM_DIST_HYST_T + (CAM_DIST_HYST_C - CAM_DIST_HYST_T) * cs;
 
@@ -2416,8 +2435,32 @@
                     const skipLabel = lastFretForString[n.s] === n.f;
                     drawNote(n, now, undefined, isNext, skipLabel, false);
                     lastFretForString[n.s] = n.f;
-                    if (n.f > 0 && n.t >= camT0 && n.t <= camT1) {
-                        const w = Math.exp(-Math.max(0, n.t - now) / camTau);
+                    // Onset in window OR started before the window but
+                    // still sustaining right now. Gate sustain carry-over
+                    // against the current frame time so camera framing
+                    // releases as soon as the sustain is no longer
+                    // rendered on screen.
+                    const nInWin = n.t >= camT0 && n.t <= camT1;
+                    const nSusActive = n.t < camT0 && n.t + (n.sus || 0) >= now;
+                    if (n.f > 0 && (nInWin || nSusActive)) {
+                        // Symmetric decay around now: previously this
+                        // clamped n.t - now at 0, giving every past-
+                        // onset note weight 1. That was a tolerable
+                        // approximation when the past window was 0.2 s
+                        // (camT0), but the sustain extension widens
+                        // the past side to seconds for held notes — a
+                        // 2-second-old ringing sustain would otherwise
+                        // pin camWX as strongly as a fresh note and
+                        // stale-out the framing for the current
+                        // phrase. Math.abs lets old sustains decay on
+                        // the same time-constant as future notes,
+                        // matching each mode's intent: twitchy
+                        // (camTau=0.35 s) drops a 0.2 s-old note's
+                        // weight to ~0.56 (consistent with "react to
+                        // recent only"), calm (camTau=0.9 s) to ~0.80
+                        // (consistent with "average a wider window").
+                        // Weight is still 1 at onset.
+                        const w = Math.exp(-Math.abs(n.t - now) / camTau);
                         camWX   += fretMid(n.f) * w;
                         camWSum += w;
                         if (n.f < camDistMin) camDistMin = n.f;
@@ -2469,14 +2512,33 @@
                     }
                     if (fretted > 0) chordCX = (cxL + cxR) / 2;
 
-                    const chWindowed = ch.t >= camT0 && ch.t <= camT1;
-                    const chW        = chWindowed ? Math.exp(-Math.max(0, ch.t - now) / camTau) : 0;
+                    // Onset in window OR chord started before the window
+                    // but is still sustaining right now. Gate sustain
+                    // carry-over against the current frame time so camera
+                    // framing releases as soon as the chord is no longer
+                    // rendered on screen.
+                    const chOnsetInWin = ch.t >= camT0 && ch.t <= camT1;
+                    const chSusActive  = ch.t < camT0 && ch.t + maxSus >= now;
+                    const chWindowed   = chOnsetInWin || chSusActive;
+                    // Symmetric decay — see matching comment in the
+                    // single-note branch. The chord-wide chW uses
+                    // ch.t (not per-note onset) since chord notes
+                    // share a strum time.
+                    const chW          = chWindowed ? Math.exp(-Math.abs(ch.t - now) / camTau) : 0;
                     for (const cn of chordNotes) {
                         const isNext = nextNoteByString[cn.s] && Math.abs(nextNoteByString[cn.s].t - ch.t) < 0.001;
                         const skipLabel = lastFretForString[cn.s] === cn.f;
                         drawNote({ ...cn, t: ch.t, sus: cn.sus || 0 }, now, cn.f === 0 ? chordCX : undefined, isNext, skipLabel, isRepeat, 0.55);
                         lastFretForString[cn.s] = cn.f;
-                        if (cn.f > 0 && chWindowed) {
+                        // gate by THIS note's own sustain against the
+                        // current render time — drawNote has already
+                        // dropped short-sustain notes whose ringing has
+                        // ended, so they should not keep pulling the
+                        // camera frame wider than the notes actually
+                        // still on screen (chord-wide maxSus would
+                        // over-pullback for mixed-sustain chords).
+                        const cnSustainOk = chOnsetInWin || (chSusActive && ch.t + (cn.sus || 0) >= now);
+                        if (cn.f > 0 && cnSustainOk) {
                             camWX += fretMid(cn.f) * chW;
                             camWSum += chW;
                             if (cn.f < camDistMin) camDistMin = cn.f;
@@ -2652,16 +2714,45 @@
             // visible motion. Distant outliers in the full visible window
             // no longer pull either axis.
             if (camDistGot) {
-                const candidateDist = (65 + Math.max(camDistMax - camDistMin, 4) * 3) * K;
+                // Base zoom scales by fret count (camDistMax-camDistMin).
+                const baseDistU     = 65 + Math.max(camDistMax - camDistMin, 4) * 3;
+                // Low-fret pullback: world-X distance between frets is
+                // logarithmic, so a 2-fret span at the nut takes much
+                // more horizontal screen than the same span at fret 12.
+                // The base term scales by *fret count*, not world-X
+                // span, so low-fret clusters were under-allotted camera
+                // distance and clipped at the left edge (e.g. F power
+                // chord at fret 1 partially off-screen). Add a tapered
+                // bonus that kicks in below fret 5 and peaks at fret 1
+                // (≈16 extra fret-span units, i.e. 16*K world-units of
+                // distance), without affecting mid/high neck framing.
+                const lowFretBonusU = Math.max(0, 5 - camDistMin) * 4;
                 // tgtDist scales at (3 * K) per fret-span unit, so the
                 // hysteresis threshold (a fret-span dead zone) converts
                 // to tgtDist-space by multiplying by 3 * K — NOT by
                 // FRET_WIDTH_MID, which is X-axis world-units-per-fret
                 // and a different unit (would over-tighten the gate by
                 // ~4x at SCALE = 2.25).
-                if (Math.abs(candidateDist - tgtDist) > camDistHystF * 3 * K) {
-                    tgtDist = candidateDist;
+                //
+                // Hysteresis is applied to the BASE portion only. The
+                // lowFretBonus changes by 4 fret-span units per integer
+                // fret near the nut, which sits below the default-
+                // cameraSmoothing (cs=0.5) dead zone of ~8.25 fret-span
+                // units (= 2.75 * 3) and would otherwise be suppressed
+                // for fret 2 → 1 / 3 → 1 transitions — exactly the
+                // corrections this bonus exists to provide. So gate the
+                // base, then always reflect bonus changes on top by
+                // tracking the last-committed bonus contribution
+                // (prevLowFretBonus) and adjusting tgtDist for its
+                // delta whether or not the base hysteresis fires.
+                const candidateBase = baseDistU * K;
+                const baseTgt       = tgtDist - prevLowFretBonus * K;
+                if (Math.abs(candidateBase - baseTgt) > camDistHystF * 3 * K) {
+                    tgtDist = (baseDistU + lowFretBonusU) * K;
+                } else if (lowFretBonusU !== prevLowFretBonus) {
+                    tgtDist = baseTgt + lowFretBonusU * K;
                 }
+                prevLowFretBonus = lowFretBonusU;
             }
             if (camWSum > 0) {
                 const candidateX = camWX / camWSum;
@@ -3075,6 +3166,7 @@
             pFretLbl = pLane = pLaneDivider = pChordBox = pChordLbl = pBarreLine = pNoteFretLabel = pConnectorLine = pDropLine = pTechArrow = pTapChevron = null;
             gNote = gSus = gBeat = gTechArrow = gTapChevron = null;
             tgtX = curX = 0; tgtDist = curDist = CAM_DIST_BASE; tgtLookY = curLookY = 0; nStr = NSTR; _oobStringWarned = false;
+            prevLowFretBonus = 0;
         }
 
         function canvasSize(canvas) {
