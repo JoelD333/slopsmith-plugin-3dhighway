@@ -358,11 +358,14 @@
     }
     function _bgWriteGlobal(key, val) {
         const s = String(val);
-        try { localStorage.setItem('h3d_bg_' + key, s); } catch (_) { /* storage blocked */ }
-        // Stage in memory regardless of storage success, so a blocked-
-        // storage browser still applies the change and persists it for
-        // the rest of the session.
+        // Stage in memory FIRST so _bgReadSetting's "memory beats global
+        // localStorage" precedence has a true freshness guarantee even
+        // if localStorage.setItem throws partway through. Without this
+        // ordering, a quota exception thrown after the persisted slot
+        // was already mutated would leave a stale value in localStorage
+        // that's newer than _bgMemFallback.
         _bgMemFallback[key] = s;
+        try { localStorage.setItem('h3d_bg_' + key, s); } catch (_) { /* storage blocked */ }
         _bgEmitChange(key);
     }
 
@@ -1157,8 +1160,9 @@
         let mWhiteOutline = null, mSusOutline = null;
         // Shared materials for the legato technique meshes — one per geometry
         // type, reused across every pooled mesh instance to avoid per-mesh
-        // material allocation in dense HO/PO/tap passages. Built lazily on
-        // first pool() call so they pick up the active palette / scene.
+        // material allocation in dense HO/PO/tap passages. Allocated in
+        // initScene() alongside the other scene materials and disposed in
+        // teardown.
         let mTechArrow = null, mTapChevron = null;
         // Notedetect feedback outlines (issue #9). Created in initScene
         // alongside mWhiteOutline; swapped onto the note's outline mesh
@@ -2499,7 +2503,7 @@
                     const lb = pFretLbl.get();
                     const isActive = activeFrets.has(f);
                     lb.material = txtMat(f, isActive ? '#ffe84d' : '#9ab8cc', false);
-                    lb.position.set(fretMid(f), yBottom - S_GAP * 0.6, 0.5 * K);
+                    lb.position.set(fretMid(f), yBottom - S_GAP * 1.4, 0.5 * K);
                     const intensity = noteState.fretHeat[f];
                     lb.material.opacity = 0.35 + intensity * 0.65;
                     const scale = 3.5 + intensity * 2.2;
