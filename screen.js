@@ -99,7 +99,26 @@
     const CAM_TGT_TAU_T    = 0.35;  // s — twitchy: short recency time-constant
     const CAM_TGT_TAU_C    = 0.9;   // s — calm: longer time-constant (averages more)
     const CAM_TGT_HYST_T   = 0.25;  // frets — twitchy: tiny dead zone
-    const CAM_TGT_HYST_C   = 2.5;   // frets — calm: wide dead zone
+    const CAM_TGT_HYST_C   = 5.0;   // frets — calm: ~5-fret dead zone, wide
+                                    // enough to swallow chord-to-chord
+                                    // alternations across a 6-fret span
+                                    // (e.g. Am ↔ D in first position).
+
+    // Zoom (tgtDist) damping, also driven by cameraSmoothing.
+    // Issue #34 follow-up: the original PR only damped X targeting, leaving
+    // tgtDist untreated — a single distant high-fret note still pulled the
+    // camera back, then sprang forward as the note aged out of the
+    // 3.5 s lookahead window.
+    const CAM_DIST_HYST_T  = 0.5;   // fret-span — twitchy: minimal dead zone
+    const CAM_DIST_HYST_C  = 5.0;   // fret-span — calm: 5-fret span change required
+
+    // Note: we deliberately do NOT scale the camUpdate lerp speed with
+    // cameraSmoothing. Smoothing widens the hysteresis dead zones so the
+    // camera stays put through small/repetitive shifts; but when a shift
+    // *does* clear the gate (a real jump to a far fret), we want the slide
+    // to be snappy, not lethargic. The dead zone gates "should we move?",
+    // the BPM-scaled lerp answers "how fast" — keeping those orthogonal
+    // gives the right feel.
 
     const FOG_START = 200 * K;
     const FOG_END = 670 * K;
@@ -1325,17 +1344,91 @@
         const sY = s => S_BASE + (_invertedCached ? s : (nStr - 1 - s)) * S_GAP;
 
         // ── Text-sprite cache ──────────────────────────────────────────────
-        function txtMat(text, col, wide) {
-            const k = (wide ? 'W' : '') + text + '|' + col;
+        // ── Text-sprite style presets ─────────────────────────────────────
+        // Each preset describes how a class of label is rasterised.
+        // Tweak per-class look here (font, outline color/width, source
+        // canvas size). `wide` toggles a long aspect ratio for multi-char
+        // labels (chord/section names, "↑1/2", "~~~").
+        //
+        // Knobs:
+        //   font        — full CSS font shorthand (weight + size + family)
+        //   wideFont    — same, used when caller passes wide=true
+        //   srcH        — source-canvas height in px (square; wide=4×).
+        //                 Keep power-of-two so WebGL1 / Three.js retain
+        //                 mipmaps + linear-mip-linear filtering — NPOT
+        //                 textures silently fall back to no-mipmap and
+        //                 shimmer at distance.
+        //   stroke      — outline color (null = no outline)
+        //   strokeW     — outline line-width in source-canvas px
+        //   shadow      — { color, blur, dx, dy } or null
+        const TXT_STYLES = {
+            // The two fret-number sets the user wants to pop hardest.
+            fretRow: {
+                font:     '900 160px "Arial Black", "Helvetica Neue", Arial, sans-serif',
+                wideFont: '900 128px "Arial Black", "Helvetica Neue", Arial, sans-serif',
+                srcH: 256, stroke: '#0a1018', strokeW: 18,
+                shadow: { color: 'rgba(0,0,0,0.7)', blur: 14, dx: 0, dy: 0 },
+            },
+            noteFret: {
+                font:     '900 160px "Arial Black", "Helvetica Neue", Arial, sans-serif',
+                wideFont: '900 128px "Arial Black", "Helvetica Neue", Arial, sans-serif',
+                srcH: 256, stroke: '#0a1018', strokeW: 18,
+                shadow: { color: 'rgba(0,0,0,0.7)', blur: 14, dx: 0, dy: 0 },
+            },
+            // Chord names — gold script-style label, lighter outline keeps
+            // the colour readable.
+            chord: {
+                font:     'bold 80px sans-serif',
+                wideFont: 'bold 64px sans-serif',
+                srcH: 128, stroke: '#0a1018', strokeW: 6, shadow: null,
+            },
+            // Section banners ("Verse", "Chorus") — same as chord weight.
+            section: {
+                font:     'bold 80px sans-serif',
+                wideFont: 'bold 64px sans-serif',
+                srcH: 128, stroke: '#0a1018', strokeW: 6, shadow: null,
+            },
+            // Technique markers (PH, PM, AC, H/P/T, slide arrows, etc.).
+            technique: {
+                font:     'bold 80px sans-serif',
+                wideFont: 'bold 64px sans-serif',
+                srcH: 128, stroke: '#0a1018', strokeW: 6, shadow: null,
+            },
+            // Open-string "0" label on the note body itself.
+            open: {
+                font:     'bold 80px sans-serif',
+                wideFont: 'bold 64px sans-serif',
+                srcH: 128, stroke: '#0a1018', strokeW: 6, shadow: null,
+            },
+        };
+
+        function txtMat(text, col, wide, style) {
+            const sName = style || 'technique';
+            const k = sName + '|' + (wide ? 'W' : '') + text + '|' + col;
             if (txtCache[k]) return txtCache[k];
-            const w = wide ? 512 : 128, h = 128;
-            const c = document.createElement('canvas');
+            const sp = TXT_STYLES[sName] || TXT_STYLES.technique;
+            const h  = sp.srcH;
+            const w  = wide ? h * 4 : h;
+            const c  = document.createElement('canvas');
             c.width = w; c.height = h;
             const x = c.getContext('2d');
-            x.fillStyle = col;
-            x.font = `bold ${wide ? 64 : 80}px monospace`;
+            x.font = wide ? sp.wideFont : sp.font;
             x.textAlign = 'center';
             x.textBaseline = 'middle';
+            if (sp.shadow) {
+                x.shadowColor   = sp.shadow.color;
+                x.shadowBlur    = sp.shadow.blur;
+                x.shadowOffsetX = sp.shadow.dx;
+                x.shadowOffsetY = sp.shadow.dy;
+            }
+            if (sp.stroke && sp.strokeW > 0) {
+                x.lineJoin    = 'round';
+                x.miterLimit  = 2;
+                x.strokeStyle = sp.stroke;
+                x.lineWidth   = sp.strokeW;
+                x.strokeText(String(text), w / 2, h / 2);
+            }
+            x.fillStyle = col;
             x.fillText(String(text), w / 2, h / 2);
             const mat = new T.SpriteMaterial({
                 map: new T.CanvasTexture(c),
@@ -1714,12 +1807,12 @@
             });
             pTechArrow = pool(noteG, () => new T.Mesh(gTechArrow, mTechArrow));
             pTapChevron = pool(noteG, () => new T.Mesh(gTapChevron, mTapChevron));
-            pLbl = pool(lblG, () => new T.Sprite(txtMat('0', '#fff', false)));
+            pLbl  = pool(lblG,  () => new T.Sprite(txtMat('0', '#fff', false, 'technique')));
             pBeat = pool(beatG, () => new T.Line(gBeat, mBeatQ));
-            pSec = pool(lblG, () => new T.Sprite(txtMat('', '#0dd', true)));
+            pSec  = pool(lblG,  () => new T.Sprite(txtMat('', '#0dd', true, 'section')));
 
             // Dynamic fret number labels (heat-coloured, updated each frame)
-            pFretLbl = pool(lblG, () => new T.Sprite(txtMat('0', '#888', false)));
+            pFretLbl = pool(lblG, () => new T.Sprite(txtMat('0', '#888', false, 'fretRow')));
 
             // Highlight lane plane over active fret range
             pLane = pool(noteG, () => new T.Mesh(
@@ -1743,14 +1836,14 @@
                 }),
             ));
 
-            pChordLbl = pool(lblG, () => new T.Sprite(txtMat('', '#e8d080', true).clone()));
-            pBarreLine = pool(noteG, () => new T.Mesh(
+            pChordLbl   = pool(lblG,  () => new T.Sprite(txtMat('', '#e8d080', true, 'chord').clone()));
+            pBarreLine  = pool(noteG, () => new T.Mesh(
                 new T.BoxGeometry(1, 1, 1),
                 new T.MeshLambertMaterial({ color: 0xffffff, emissive: 0xffffff, emissiveIntensity: 0.9, transparent: true, depthWrite: false }),
             ));
 
             // Per-note fret number below note with connector line
-            pNoteFretLabel = pool(lblG, () => new T.Sprite(txtMat('0', '#ffffff', false).clone()));
+            pNoteFretLabel = pool(lblG, () => new T.Sprite(txtMat('0', '#ffffff', false, 'noteFret').clone()));
             pConnectorLine = pool(noteG, () => new T.Line(
                 new T.BufferGeometry().setFromPoints([new T.Vector3(0, 0, 0), new T.Vector3(0, 1, 0)]),
                 new T.LineBasicMaterial({ color: 0xaaaaaa, transparent: true, opacity: 0.5 }),
@@ -2287,12 +2380,14 @@
                 if (now - fretLastActiveTime[f] < FRET_COOLDOWN) activeFrets.add(f);
             }
 
-            // Camera targeting. fMin/fMax over the full visible window
-            // continue to drive tgtDist (zoom-out for wide chords). tgtX
-            // is driven separately by a recency-weighted centroid in
-            // world units over a narrower window (issue #34) so distant
-            // outliers don't yank the camera left/right.
-            let fMin = 99, fMax = 0, got = false;
+            // Camera targeting (issue #34 + follow-up). Both tgtX and
+            // tgtDist now derive from the narrowed [camT0, camT1] window
+            // — tgtX as a recency-weighted centroid, tgtDist from the
+            // fret span — so distant outliers can't yank either axis.
+            // Hysteresis dead-zone widths key off cameraSmoothing; the
+            // camUpdate() lerp itself stays BPM-driven only, so the gate
+            // controls whether the camera moves and the BPM lerp controls
+            // how fast it slides once a move is committed.
             const cs        = cameraSmoothing;
             const camAhead  = CAM_TGT_AHEAD_T + (CAM_TGT_AHEAD_C - CAM_TGT_AHEAD_T) * cs;
             const camTau    = CAM_TGT_TAU_T   + (CAM_TGT_TAU_C   - CAM_TGT_TAU_T)   * cs;
@@ -2300,6 +2395,11 @@
             const camT0     = now - CAM_TGT_BEHIND;
             const camT1     = now + camAhead;
             let camWX = 0, camWSum = 0;
+            // tgtDist hysteresis (issue #34 follow-up): track fret span over
+            // the SAME narrowed window as X targeting, so a single high-fret
+            // note 2.5 s away no longer pulls the zoom out and back.
+            let camDistMin = 99, camDistMax = 0, camDistGot = false;
+            const camDistHystF = CAM_DIST_HYST_T + (CAM_DIST_HYST_C - CAM_DIST_HYST_T) * cs;
 
             // ── Single notes ──────────────────────────────────────────────
             const lastFretForString = new Array(nStr).fill(undefined);
@@ -2316,11 +2416,13 @@
                     const skipLabel = lastFretForString[n.s] === n.f;
                     drawNote(n, now, undefined, isNext, skipLabel, false);
                     lastFretForString[n.s] = n.f;
-                    if (n.f > 0 && n.t <= t1) { fMin = Math.min(fMin, n.f); fMax = Math.max(fMax, n.f); got = true; }
                     if (n.f > 0 && n.t >= camT0 && n.t <= camT1) {
                         const w = Math.exp(-Math.max(0, n.t - now) / camTau);
                         camWX   += fretMid(n.f) * w;
                         camWSum += w;
+                        if (n.f < camDistMin) camDistMin = n.f;
+                        if (n.f > camDistMax) camDistMax = n.f;
+                        camDistGot = true;
                     }
                 }
             }
@@ -2335,9 +2437,9 @@
                     // Filter chord notes to in-range strings once. All
                     // chord-level aggregations (maxSus, repeat-chord
                     // signature, open-string centroid, frame-box bounds,
-                    // active-fret highlights, fMin/fMax) read from
-                    // chordNotes so a clamped 9th-string note can't, for
-                    // instance, extend the chord's linger beyond its
+                    // active-fret highlights, camera-window dist) read
+                    // from chordNotes so a clamped 9th-string note can't,
+                    // for instance, extend the chord's linger beyond its
                     // visible sustain.
                     const chordNotes = filterValidNotes(ch.notes);
                     if (chordNotes.length === 0) continue;
@@ -2374,8 +2476,13 @@
                         const skipLabel = lastFretForString[cn.s] === cn.f;
                         drawNote({ ...cn, t: ch.t, sus: cn.sus || 0 }, now, cn.f === 0 ? chordCX : undefined, isNext, skipLabel, isRepeat, 0.55);
                         lastFretForString[cn.s] = cn.f;
-                        if (cn.f > 0 && ch.t <= t1) { fMin = Math.min(fMin, cn.f); fMax = Math.max(fMax, cn.f); got = true; }
-                        if (cn.f > 0 && chWindowed) { camWX += fretMid(cn.f) * chW; camWSum += chW; }
+                        if (cn.f > 0 && chWindowed) {
+                            camWX += fretMid(cn.f) * chW;
+                            camWSum += chW;
+                            if (cn.f < camDistMin) camDistMin = cn.f;
+                            if (cn.f > camDistMax) camDistMax = cn.f;
+                            camDistGot = true;
+                        }
                     }
 
                     // Chord frame-box
@@ -2415,7 +2522,7 @@
                                 const postFade = chDt < 0 ? Math.max(0, 1 + chDt / 0.55) : 1;
                                 const lblW = 28 * K, lblH = 9 * K;
                                 const lbl = pChordLbl.get();
-                                const mat = txtMat(chordName, '#e8d080', true);
+                                const mat = txtMat(chordName, '#e8d080', true, 'chord');
                                 if (lbl.material.map !== mat.map) { lbl.material.map = mat.map; lbl.material.needsUpdate = true; }
                                 lbl.material.opacity = Math.min(1, 0.3 + fade * 0.7) * postFade;
                                 lbl.position.set((cx - width / 2) + lblW / 2, yMaxF + lblH / 2, z);
@@ -2502,7 +2609,7 @@
                 for (let f = 1; f <= NFRETS; f++) {
                     const lb = pFretLbl.get();
                     const isActive = activeFrets.has(f);
-                    lb.material = txtMat(f, isActive ? '#ffe84d' : '#9ab8cc', false);
+                    lb.material    = txtMat(f, isActive ? '#ffe84d' : '#9ab8cc', false, 'fretRow');
                     lb.position.set(fretMid(f), yBottom - S_GAP * 1.4, 0.5 * K);
                     const intensity = noteState.fretHeat[f];
                     lb.material.opacity = 0.35 + intensity * 0.65;
@@ -2532,19 +2639,29 @@
                 for (const s of sections) {
                     if (s.time < t0 || s.time > t1) continue;
                     const sp = pSec.get();
-                    sp.material = txtMat(s.name, '#00cccc', true);
+                    sp.material = txtMat(s.name, '#00cccc', true, 'section');
                     sp.scale.set(20 * K, 5 * K, 1);
                     sp.position.set(fretX(12), labelY, dZ(s.time - now));
                 }
             }
 
             // ── Camera target ─────────────────────────────────────────────
-            // tgtDist still tracks the visible-window fret span so wide
-            // chords pull the camera back; tgtX uses the narrowed,
-            // recency-weighted centroid with a hysteresis dead zone so
-            // small intra-cluster shifts don't produce visible motion.
-            if (got) {
-                tgtDist = (65 + Math.max(fMax - fMin, 4) * 3) * K;
+            // tgtX, tgtDist both driven from the narrowed [camT0, camT1]
+            // window, with hysteresis dead zones scaled by cameraSmoothing
+            // so small candidate shifts inside a cluster don't trigger
+            // visible motion. Distant outliers in the full visible window
+            // no longer pull either axis.
+            if (camDistGot) {
+                const candidateDist = (65 + Math.max(camDistMax - camDistMin, 4) * 3) * K;
+                // tgtDist scales at (3 * K) per fret-span unit, so the
+                // hysteresis threshold (a fret-span dead zone) converts
+                // to tgtDist-space by multiplying by 3 * K — NOT by
+                // FRET_WIDTH_MID, which is X-axis world-units-per-fret
+                // and a different unit (would over-tighten the gate by
+                // ~4x at SCALE = 2.25).
+                if (Math.abs(candidateDist - tgtDist) > camDistHystF * 3 * K) {
+                    tgtDist = candidateDist;
+                }
             }
             if (camWSum > 0) {
                 const candidateX = camWX / camWSum;
@@ -2652,7 +2769,7 @@
                 if (n.f === 0) {
                     // "0" label on open string
                     const lb = pLbl.get();
-                    lb.material = txtMat(0, hit ? '#fff' : '#ddd', false);
+                    lb.material = txtMat(0, hit ? '#fff' : '#ddd', false, 'open');
                     lb.scale.set(NW * 0.7, NH * 0.8, 1);
                     lb.position.set(x, y + vibrato, noteZ + 0.01 * K);
                 } else if (showFretOnNote && n.f > 0) {
@@ -2671,7 +2788,7 @@
                     // of how K resolves, units consistent with the
                     // core's offset.
                     const lb = pLbl.get();
-                    lb.material = txtMat(n.f, hit ? '#fff' : '#eee', false);
+                    lb.material = txtMat(n.f, hit ? '#fff' : '#eee', false, 'noteFret');
                     lb.scale.set(NW * 0.7, NH * 0.85, 1);
                     lb.position.set(x, y + vibrato, noteZ + 0.005);
                 }
@@ -2730,12 +2847,12 @@
                 let yo = y + NH * 0.8 * sLbl;
                 if (n.bn > 0) {
                     const l = pLbl.get();
-                    l.material = txtMat('↑' + bendText(n.bn), '#fff', true);
+                    l.material = txtMat('↑' + bendText(n.bn), '#fff', true, 'technique');
                     l.scale.set(NH * 3.6 * sLbl, NH * 1.5 * sLbl, 1); l.position.set(x, yo, noteZ); yo += NH * 1.2 * sLbl;
                 }
                 if (n.sl && n.sl !== -1) {
                     const l = pLbl.get();
-                    l.material = txtMat(n.sl > n.f ? '↗' : '↘', '#fff', false);
+                    l.material = txtMat(n.sl > n.f ? '↗' : '↘', '#fff', false, 'technique');
                     l.scale.set(NH * 1.6 * sLbl, NH * 1.6 * sLbl, 1); l.position.set(x + NW * 0.6 * sLbl, yo, noteZ);
                 }
                 if (n.ho || n.po || n.tp) {
@@ -2761,12 +2878,12 @@
                 }
                 if (n.ac) {
                     const l = pLbl.get();
-                    l.material = txtMat('>', '#fff', false);
+                    l.material = txtMat('>', '#fff', false, 'technique');
                     l.scale.set(NH * 1.6 * sLbl, NH * 1.6 * sLbl, 1); l.position.set(x, yo, noteZ); yo += NH * 1.2 * sLbl;
                 }
                 if (n.tr) {
                     const l = pLbl.get();
-                    l.material = txtMat('~~~', '#ff0', true);
+                    l.material = txtMat('~~~', '#ff0', true, 'technique');
                     l.scale.set(NH * 3.0 * sLbl, NH * 1.2 * sLbl, 1); l.position.set(x, yo, noteZ);
                 }
                 if (n.pm) {
@@ -2775,7 +2892,7 @@
                     // anchored to the body not floating above.
                     const pmMark = pLbl.get();
                     if (!pmMark._pmMat) {
-                        pmMark._pmMat = txtMat('X', '#ffffff', false).clone();
+                        pmMark._pmMat = txtMat('X', '#ffffff', false, 'technique').clone();
                         _ownedClonedMats.push(pmMark._pmMat);
                     }
                     pmMark.material = pmMark._pmMat;
@@ -2786,7 +2903,7 @@
                 }
                 if (n.hp) {
                     const l = pLbl.get();
-                    l.material = txtMat('PH', '#ff0', true);
+                    l.material = txtMat('PH', '#ff0', true, 'technique');
                     l.scale.set(NH * 2.1 * sLbl, NH * 1.2 * sLbl, 1); l.position.set(x, y - NH * 1.1 * sLbl, noteZ);
                 }
 
@@ -2797,8 +2914,8 @@
                     // fade out in the last 0.5 s so it doesn't overlap the fret-row label at Z=0
                     const alpha = Math.max(0, Math.min(1, dt / 0.5)) * Math.min(1, (AHEAD - dt) / (AHEAD * 0.4));
 
-                    const fretLabel = pNoteFretLabel.get();
-                    const cachedMat = txtMat(n.f, '#ffffff', false);
+                    const fretLabel  = pNoteFretLabel.get();
+                    const cachedMat  = txtMat(n.f, '#ffffff', false, 'noteFret');
                     if (fretLabel.material.map !== cachedMat.map) {
                         fretLabel.material.map = cachedMat.map;
                         fretLabel.material.needsUpdate = true;

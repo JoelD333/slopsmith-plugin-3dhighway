@@ -71,7 +71,7 @@ Each entry names the function or banner you should grep for, plus key sub-blocks
 - **Fret count** → `NFRETS` constant. Increasing requires nothing else.
 - **Fret X positioning** → `fretX(f)` and `fretMid(f)` (top-level helpers). Logarithmic guitar-fret spacing within `SCALE`.
 - **Fretboard plane / fret wires / fret dots** → `buildBoard()`, separate banner-style comment blocks (`// Fret wires`, `// Fret dots`). The dark background plane is the first thing built; main fret wires use `0xbbbbff` / opacity 0.8, minor wires `0x666688` / opacity 0.4. Single/double dots: `DOTS` array + `DDOTS` set in the constants block.
-- **Fret-row label colors / sizing** (the heat-coloured row of fret numbers below the board) → `update()`, `// ── Dynamic fret number row ──` block. Active = `#ffe84d`, inactive = `#9ab8cc`, opacity / scale driven by `noteState.fretHeat[f]`.
+- **Fret-row label colors / sizing** (the heat-coloured row of fret numbers below the board) → `update()`, `// ── Dynamic fret number row ──` block. Active = `#ffe84d`, inactive = `#9ab8cc`, opacity / scale driven by `noteState.fretHeat[f]`. Text rendering (font, outline, shadow) is governed by the `'fretRow'` preset in `TXT_STYLES` — see "Tweaking text-sprite styling".
 - **Active-fret cooldown** → `FRET_COOLDOWN` constant. How long after the last note in a fret it stays in the active set.
 
 ### Notes
@@ -81,8 +81,8 @@ Each entry names the function or banner you should grep for, plus key sub-blocks
 - **Note color** → `mStr[s]` (idle) / `mGlow[s]` (hit), built in `initScene()`. Hit material is white-with-emissive, idle is dim emissive of the string color.
 - **Sustain trail** → `// ── Sustain trail ──` block in `drawNote()`. Geometry: scaled `gSus` (`BoxGeometry(1,1,1)`). Width `NW * 0.85`, height `NH * 0.12`. Outline mesh + colored core mesh.
 - **Lane drop line** → `// ── Lane drop line ──` block in `drawNote()`. Vertical line from each upcoming note down to the fretboard plane in the string's color.
-- **Per-note fret connector label** → `// ── Per-note fret connector label ──` block in `drawNote()`. Number below the board with a thin line up to the note. Be careful with `replace_all` on the `0.5` and `0.4` floats in the alpha formula — they're separate constants.
-- **Technique labels** (bend, slide, hammer/pull/tap, accent, tremolo, palm-mute, pinch harmonic) → `// ── Technique labels ──` block in `drawNote()`. Each is a small if-block; `txtMat(text, color, wide)` is the cached sprite-material helper.
+- **Per-note fret connector label** → `// ── Per-note fret connector label ──` block in `drawNote()`. Number below the board with a thin line up to the note. Be careful with `replace_all` on the `0.5` and `0.4` floats in the alpha formula — they're separate constants. Uses the `'noteFret'` preset in `TXT_STYLES` (also applied to the on-body fret number when `showFretOnNote` is enabled).
+- **Technique labels** (bend, slide, hammer/pull/tap, accent, tremolo, palm-mute, pinch harmonic) → `// ── Technique labels ──` block in `drawNote()`. Each is a small if-block; `txtMat(text, color, wide, style)` is the cached sprite-material helper. The `'technique'` preset in `TXT_STYLES` controls font/outline/shadow for these — see "Tweaking text-sprite styling".
 - **Open-string note** → special-cased throughout `drawNote()`: `n.f === 0`. Wider/flatter geometry, "0" label sprite, uses `openX` (the chord's open-string centroid) when supplied.
 - **Board projection ("ghost" preview)** → `// ── Board projection ──` block in `drawNote()`. Two meshes per string (`projMeshArr`, `projGlowArr`), one visible per frame for the next note. Linger window `PROJ_WIN`. **The glow has `renderOrder = -1`** which fights the strings — see Pitfall #6.
 
@@ -163,7 +163,7 @@ If a pool's mesh has per-instance state (its own material clone, its own texture
 ## Key gotchas / pitfalls
 
 1. **Adding a new pool? Reset it.** The reset block at the top of `update()` is easy to miss when adding a new pool elsewhere.
-2. **`txtMat()` is cache-keyed by `(text, color, wide)`.** Calling it with a numeric `text` works (it's coerced via `String(...)`), but new label content creates a new texture forever. Don't generate dynamic per-frame text (e.g. interpolated values) through `txtMat()` or you'll leak GPU memory. For static labels that change occasionally (chord names, fret numbers), the cache is fine.
+2. **`txtMat()` is cache-keyed by `(style, text, color, wide)`.** Calling it with a numeric `text` works (it's coerced via `String(...)`), but new label content creates a new texture forever. Don't generate dynamic per-frame text (e.g. interpolated values) through `txtMat()` or you'll leak GPU memory. For static labels that change occasionally (chord names, fret numbers), the cache is fine. The `style` arg picks a preset from the `TXT_STYLES` table — see "Tweaking text-sprite styling" below.
 3. **Disposal in `teardown()` matters.** Three.js doesn't garbage-collect GPU resources. Every `material.dispose()`, `geometry.dispose()`, `map.dispose()`, and `ren.dispose()` call there is load-bearing. `teardown()` is called from `init()` (when re-initing), `destroy()` (setRenderer swap or `highway.stop()`), and on init failure.
 4. **Don't use `tuning.length` for string count.** `bundle.tuning` (and `arr.tuning` server-side) is always 6 elements even for bass — slopsmith pre-fills the array with zeros for unused strings. Use `bundle.stringCount` (slopsmith#93), with `/bass/i.test(arrangement)` as the only acceptable fallback. There's a comment in `resolveStringCount()` documenting this.
 5. **lyricsCanvas DOM order.** The 2D overlay canvas is appended to `wrap` AFTER `ren.domElement` and given `z-index:1`. This is the empirically-correct order — earlier versions had it before the WebGL canvas, which broke in splitscreen panels with `position:relative; overflow:hidden`. Don't reorder without testing both modes.
@@ -182,6 +182,32 @@ The eight-color palette `S_COL` is the single source of truth for per-string col
 If a planned color-palette feature lands (issue #10), expect it to swap the palette source array but keep this single-array indirection. Anything that hardcodes color today will break that swap; flag it during review.
 
 Non-string colors (lane target `0x4488ff`, fret-row label colors `#ffe84d` / `#9ab8cc`, fret-dot color `0x556677`, lyrics box rgba, chord-name gold `#e8d080`, etc.) are scattered as literals — that's intentional for now, since they're scene-wide accents rather than per-string. Pulling them into named constants is fine if you're already in that area.
+
+## Tweaking text-sprite styling
+
+Every text label in the 3D scene is rasterised by `txtMat(text, color, wide, style)` and the look (font, outline, drop-shadow, source-canvas resolution) is driven by a preset in the `TXT_STYLES` table at the top of `createFactory()`. **Do not edit the body of `txtMat()` to change a single label class** — change the relevant preset entry instead, so the rest stay unaffected.
+
+Current presets and their callers:
+
+| Preset | Used by | Default look |
+|---|---|---|
+| `fretRow` | Fret-number row under the board (`update()`, fret-row block) | Arial Black 900, 256px source canvas, 18px dark outline + soft drop-shadow — designed to pop against any background |
+| `noteFret` | Per-note connector numbers + on-body fret label (`drawNote()`) | Same heavy treatment as `fretRow` |
+| `chord` | 3D chord-name labels above chord boxes | bold sans, 128px source, 6px outline (lighter so the gold reads) |
+| `section` | Section banners ("Verse", "Chorus") at fret 12 | bold sans, 128px source, 6px outline |
+| `technique` | Bend / slide / H / P / T / PH / PM / accent / tremolo / open-string overlay | bold sans, 128px source, 6px outline |
+| `open` | The "0" label on open-string note bodies | bold sans, 128px source, 6px outline |
+
+Style fields:
+
+- `font` / `wideFont` — full CSS font shorthand (weight + size + family); `wideFont` is used when `wide=true` (long-aspect labels: chord names, section names, "↑1/2", "~~~"). Keep both in sync if you change weight or family.
+- `srcH` — source-canvas height in px. Wide labels use `srcH * 4` for width. Larger `srcH` keeps glyph strokes crisp after bilinear downsampling onto small sprites — bumping it from 128 → 256 was the difference between thin-and-blurry and crisp on the fret-number presets. **Keep `srcH` power-of-two** (128, 256, 512, …): WebGL1 and Three.js silently disable mipmap generation on NPOT textures and fall back to a non-mipmap min-filter, which causes shimmer/aliasing on labels far down the highway. The 4× width derivation preserves POT-ness too (e.g. 256 → 1024 wide).
+- `stroke` / `strokeW` — outline color and line-width in source-canvas px. Set `stroke: null` or `strokeW: 0` to skip the outline (faster cache rasterisation, no contrast halo).
+- `shadow` — `{ color, blur, dx, dy }` or `null`. Drawn via canvas 2D `shadowColor` / `shadowBlur` / `shadowOffsetX/Y` *before* the stroke and fill, so it haloes the whole glyph.
+
+**Cache key includes the preset name** (`style|wide|text|color`), so two presets with otherwise-identical text produce two distinct cached materials. Adding a new preset is safe — just add the entry to `TXT_STYLES` and pass its name as the 4th arg at the call site. Forgetting to pass `style` falls back to `'technique'` (the broadest, most generic preset) and is the right default for a brand-new label class.
+
+**Don't generate per-frame distinct text through `txtMat()`** (e.g. interpolated values, tick counters). The cache is unbounded and will leak GPU memory across the session — see Pitfall #2.
 
 ## Lifecycle (setRenderer contract)
 
